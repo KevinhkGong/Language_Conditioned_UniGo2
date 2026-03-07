@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data & checkpoints
+data/synthetic/*
+data/real/*
+!data/synthetic/.gitkeep
+!data/real/.gitkeep
+*.pt
+*.pth
+*.ckpt
+
+# Environment
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+wandb/

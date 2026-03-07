@@ -1,0 +1,27 @@
+# ---- Core ----
+numpy>=1.24,<2.0
+opencv-python>=4.8
+pyyaml>=6.0
+pillow>=10.0
+
+# ---- Deep Learning ----
+torch>=2.2
+torchvision>=0.17
+
+# ---- LLM (Stage A) ----
+openai>=1.12
+
+# ---- Perception (Stage B) ----
+# SAM2 - install from source separately, see README
+transformers>=4.38
+
+# ---- Simulation ----
+pybullet>=3.2.5
+
+# ---- Robot SDK ----
+# unitree_sdk2py - install from source separately, see README
+
+# ---- Utilities ----
+matplotlib>=3.8
+scipy>=1.12
+tqdm>=4.66
