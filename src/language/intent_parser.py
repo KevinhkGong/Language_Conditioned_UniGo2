@@ -18,7 +18,6 @@ from openai import OpenAI
 
 
 # ---- Data Structures ----
-
 @dataclass
 class Target:
     category: str                    # e.g. "button", "box", "ball"
@@ -38,7 +37,6 @@ class TaskSpec:
 
 
 # ---- Function Schema for GPT-4 ----
-
 EXTRACTION_FUNCTION = {
     "name": "extract_task_spec",
     "description": (
@@ -164,7 +162,6 @@ class IntentParser:
 
 
 # ---- CLI ----
-
 def main():
     parser = argparse.ArgumentParser(
         description="Parse a natural language robot command into a structured task spec."
