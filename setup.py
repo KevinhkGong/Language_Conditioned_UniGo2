@@ -6,5 +6,5 @@ setup(
     description="Language-conditioned whole-body contact manipulation for Unitree Go2",
     authors=["Hongkun Gong", "Hanzhi Bian"],
     packages=find_packages(),
-    python_requires=">=3.10",
+    python_requires=">=3.11",
 )

@@ -1,27 +1,36 @@
-# ---- Core ----
-numpy>=1.24,<2.0
-opencv-python>=4.8
-pyyaml>=6.0
-pillow>=10.0
+# =============================================================================
+# Language-Conditioned Whole-Body Contact Manipulation — Dependencies
+#
+# Environment: Python 3.11, CUDA 12.8, RTX 5080
+# Isaac Sim 5.1.0 + Isaac Lab installed separately (see README)
+# =============================================================================
 
 # ---- Deep Learning ----
-torch>=2.2
-torchvision>=0.17
+# PyTorch 2.7.0 with CUDA 12.8 — install FIRST, before other packages:
+#   pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+
+# ---- Isaac Sim & Isaac Lab ----
+# Install separately (not via this file):
+#   pip install 'isaacsim[all,extscache]==5.1.0' --extra-index-url https://pypi.nvidia.com
+#   git clone https://github.com/isaac-sim/IsaacLab.git && cd IsaacLab && ./isaaclab.sh --install
 
 # ---- LLM (Stage A) ----
 openai>=1.12
 
 # ---- Perception (Stage B) ----
-# SAM2 - install from source separately, see README
+# SAM2 — install from source:
+#   pip install git+https://github.com/facebookresearch/sam2.git
 transformers>=4.38
 
-# ---- Simulation ----
-pybullet>=3.2.5
-
-# ---- Robot SDK ----
-# unitree_sdk2py - install from source separately, see README
-
-# ---- Utilities ----
+# ---- Core Utilities ----
+numpy>=1.26,<2.0
+opencv-python>=4.8
+pyyaml>=6.0
+pillow>=10.0
 matplotlib>=3.8
 scipy>=1.12
 tqdm>=4.66
+
+# ---- Robot SDK (Phase 2) ----
+# unitree_sdk2py — install from source when needed:
+#   pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
