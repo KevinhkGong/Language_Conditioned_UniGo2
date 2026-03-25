@@ -114,6 +114,9 @@ class PressEnvCfg(DirectRLEnvCfg):
     button_center_z  = 0.04        # z of button centers (panel_size[2] + button_height/2)
     button_h_spacing = 0.10        # lateral (y) spacing between button columns
     button_v_spacing = 0.10        # fore-aft (x) spacing between button rows
+    # Center the button grid at the FR foot's natural y position so the robot
+    # needs minimal lateral correction — prevents destabilizing sideways slides
+    button_y_center  = -0.15       # FR foot natural y offset from base center
 
     # Contact detection
     contact_force_threshold = 1.0  # Newtons — minimum force to count as a "press"
@@ -205,7 +208,9 @@ class PressEnv(DirectRLEnv):
                 self.button_positions[env_id, btn_id, 0] = (
                     self.cfg.panel_distance + offsets[btn_id][0]
                 )  # x: fore-aft position on panel
-                self.button_positions[env_id, btn_id, 1] = offsets[btn_id][1]  # y: lateral
+                self.button_positions[env_id, btn_id, 1] = (
+                    self.cfg.button_y_center + offsets[btn_id][1]
+                )  # y: lateral, centered at FR foot natural position
                 self.button_positions[env_id, btn_id, 2] = self.cfg.button_center_z  # z: all same height
 
     # ---- Scene Setup ----
@@ -241,7 +246,7 @@ class PressEnv(DirectRLEnv):
                 ),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(self.cfg.panel_distance, 0.0, panel_z),
+                pos=(self.cfg.panel_distance, self.cfg.button_y_center, panel_z),
             ),
         )
         self.panel = RigidObject(panel_cfg)
@@ -284,9 +289,9 @@ class PressEnv(DirectRLEnv):
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(
-                        self.cfg.panel_distance + btn_offsets[i][0],  # x: fore-aft on panel
-                        btn_offsets[i][1],                             # y: lateral
-                        self.cfg.button_center_z,                      # z: on top of panel
+                        self.cfg.panel_distance + btn_offsets[i][0],           # x: fore-aft on panel
+                        self.cfg.button_y_center + btn_offsets[i][1],          # y: centered at FR foot
+                        self.cfg.button_center_z,                               # z: on top of panel
                     ),
                     # No rotation — default cylinder is already vertical
                 ),

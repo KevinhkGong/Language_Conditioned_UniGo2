@@ -83,12 +83,19 @@ class HeuristicPolicy:
 
 
 
-        # Cache FR foot body index for lateral correction
+        # Cache FR foot body index
         fr_foot_indices, _ = self.env.robot.find_bodies("FR_foot")
         self._fr_foot_idx = fr_foot_indices[0]
 
-        # Cache default joint positions for use during Phase 1 stabilisation
-        # Shape: (num_envs, 12) — set after first reset when robot data is ready
+        # FR foot offset from base measured at reset (before physics settles).
+        # foot_world = base_world + _foot_offset
+        # To place foot at button: base_target = button_pos - _foot_offset
+        # Gives base_z = button_z + 0.300 = 0.340m (slight crouch, not floating)
+        self._foot_offset = torch.tensor(
+            [+0.178, -0.173, -0.300], device=self.device
+        )
+
+        # Cache default joint positions for Phase 1 stabilisation
         self._default_joint_pos: torch.Tensor | None = None
 
     def __call__(self, obs: torch.Tensor) -> torch.Tensor:
@@ -109,14 +116,13 @@ class HeuristicPolicy:
         base_quat  = obs[:, 27:31]   # (num_envs, 4) quaternion wxyz
         target_pos = obs[:, 37:40]   # (num_envs, 3) world frame
 
-        delta_x = target_pos[:, 0] - base_pos[:, 0]   # forward distance to button
-
-        # Lateral offset: compute from FR foot position, not base position.
-        # The FR foot sits ~0.188m to the right of the base (y direction).
-        # Steering the base toward target_y would leave the foot 0.188m short.
-        # Instead we measure how far the FOOT is from the button laterally.
-        fr_foot_pos = self.env.robot.data.body_pos_w[:, self._fr_foot_idx, :]
-        delta_y = target_pos[:, 1] - fr_foot_pos[:, 1]  # foot-to-button lateral gap
+        # Compute how far the base needs to move to place foot at button.
+        # base_target = button_pos - foot_offset
+        # delta = base_target - base_pos = (button_pos - foot_offset) - base_pos
+        base_target_x = target_pos[:, 0] - self._foot_offset[0]
+        base_target_y = target_pos[:, 1] - self._foot_offset[1]
+        delta_x = base_target_x - base_pos[:, 0]   # how far base needs to go forward
+        delta_y = base_target_y - base_pos[:, 1]   # how far base needs to go laterally
 
         # --- Phase flag ---
         # True  = within press range AND not badly overshot
@@ -200,17 +206,21 @@ class HeuristicPolicy:
         if pressing.any():
             pressing_ids = torch.where(pressing)[0]
 
+            # Slide base gradually toward the target position (same as Phase 1).
+            # base_target = button_pos - foot_offset (x and y only, keep z).
+            # Moving gradually avoids the destabilizing lurch from a full teleport.
+            btn_pos  = target_pos[pressing]                             # (k, 3)
+            base_tgt = btn_pos - self._foot_offset.unsqueeze(0)        # (k, 3)
+
             current_pos  = base_pos[pressing].clone()
             current_quat = base_quat[pressing].clone()
 
-            # x is already close enough — stop forward sliding to avoid
-            # overshooting past the panel. Only correct lateral (y) offset.
-            lat_step = torch.clamp(
-                self.lateral_gain * delta_y[pressing],
-                min=-self.slide_speed * 2,
-                max= self.slide_speed * 2,
-            )
-            current_pos[:, 1] += lat_step
+            # Step toward base_target in x and y, clamped to slide_speed
+            dx = base_tgt[:, 0] - current_pos[:, 0]
+            dy = base_tgt[:, 1] - current_pos[:, 1]
+            current_pos[:, 0] += torch.clamp(dx, min=-self.slide_speed, max=self.slide_speed)
+            current_pos[:, 1] += torch.clamp(dy, min=-self.slide_speed * 2, max=self.slide_speed * 2)
+            # z unchanged — keep current crouched height
 
             root_pose = torch.cat([current_pos, current_quat], dim=-1)
             self.env.robot.write_root_pose_to_sim(root_pose, env_ids=pressing_ids)
