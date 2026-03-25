@@ -101,15 +101,19 @@ class PressEnvCfg(DirectRLEnvCfg):
     )
 
     # --- Task parameters ---
-    # Panel: a flat rigid body that holds the buttons
-    panel_distance = 0.8            # meters in front of robot
-    panel_height = 0.15             # height of button centers above ground
-    panel_size = (0.3, 0.3, 0.02)  # width, height, depth (meters)
+    # Panel: flat box lying on the ground, buttons sit on top
+    panel_distance = 0.8            # meters in front of robot (x direction)
+    panel_size = (0.3, 0.3, 0.02)  # x=width(along robot approach), y=lateral, z=thickness
+    # Panel top surface is at z = panel_size[2] = 0.02m
 
-    # Buttons: small cylinders on the panel surface
+    # Buttons: vertical cylinders sitting on top of the panel
     num_buttons = 4                 # total buttons (1 target + 3 distractors)
-    button_radius = 0.02            # meters
-    button_depth = 0.015            # how far buttons protrude from panel
+    button_radius = 0.04            # meters
+    button_height = 0.04            # cylinder height (sticks up from panel)
+    # Button center z = panel top + half button height = 0.02 + 0.02 = 0.04m
+    button_center_z  = 0.04        # z of button centers (panel_size[2] + button_height/2)
+    button_h_spacing = 0.10        # lateral (y) spacing between button columns
+    button_v_spacing = 0.10        # fore-aft (x) spacing between button rows
 
     # Contact detection
     contact_force_threshold = 1.0  # Newtons — minimum force to count as a "press"
@@ -171,31 +175,38 @@ class PressEnv(DirectRLEnv):
             self.num_envs, self.cfg.num_buttons, 3, device=self.device
         )
 
+        # Cache FR_foot body index for contact detection
+        # body_pos_w shape: (num_envs, num_bodies, 3)
+        fr_foot_indices, _ = self.robot.find_bodies("FR_foot")
+        self.fr_foot_idx = fr_foot_indices[0]  # scalar int
+
         # Pre-compute button layout on the panel (2×2 grid)
         self._init_button_layout()
 
     def _init_button_layout(self):
         """Compute the 2×2 grid positions for buttons on the panel.
 
-        Layout (viewed from robot's perspective):
-            [0] [1]     (top row)
-            [2] [3]     (bottom row)
+        Layout (top-down view, panel flat on ground):
+            [0] [1]   (far row,  x = panel_distance - h_spacing/2)
+            [2] [3]   (near row, x = panel_distance + h_spacing/2)
+        All buttons at same z (button_center_z = panel top + button_height/2).
         """
-        spacing = self.cfg.panel_size[0] / 3  # spacing between buttons
-        offsets = torch.tensor([
-            [-spacing / 2,  spacing / 2],   # button 0: top-left
-            [ spacing / 2,  spacing / 2],   # button 1: top-right
-            [-spacing / 2, -spacing / 2],   # button 2: bottom-left
-            [ spacing / 2, -spacing / 2],   # button 3: bottom-right
-        ], device=self.device)
+        y_spacing = self.cfg.button_h_spacing   # lateral (y) spacing
+        x_spacing = self.cfg.button_v_spacing   # fore-aft (x) spacing
+        offsets = [
+            (-x_spacing / 2, -y_spacing / 2),  # button 0: far-left
+            (-x_spacing / 2,  y_spacing / 2),  # button 1: far-right
+            ( x_spacing / 2, -y_spacing / 2),  # button 2: near-left
+            ( x_spacing / 2,  y_spacing / 2),  # button 3: near-right
+        ]
 
         for env_id in range(self.num_envs):
             for btn_id in range(self.cfg.num_buttons):
-                self.button_positions[env_id, btn_id, 0] = self.cfg.panel_distance  # x: forward
-                self.button_positions[env_id, btn_id, 1] = offsets[btn_id, 0]       # y: lateral
-                self.button_positions[env_id, btn_id, 2] = (
-                    self.cfg.panel_height + offsets[btn_id, 1]
-                )  # z: vertical
+                self.button_positions[env_id, btn_id, 0] = (
+                    self.cfg.panel_distance + offsets[btn_id][0]
+                )  # x: fore-aft position on panel
+                self.button_positions[env_id, btn_id, 1] = offsets[btn_id][1]  # y: lateral
+                self.button_positions[env_id, btn_id, 2] = self.cfg.button_center_z  # z: all same height
 
     # ---- Scene Setup ----
 
@@ -215,26 +226,29 @@ class PressEnv(DirectRLEnv):
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
         # Spawn the panel as a static rigid body (thin box)
+        # Panel lies flat on the ground — z = half thickness so top surface at z=0.02m
+        panel_z = self.cfg.panel_size[2] / 2   # 0.01m
         panel_cfg = RigidObjectCfg(
             prim_path="/World/envs/env_.*/Panel",
             spawn=sim_utils.CuboidCfg(
                 size=self.cfg.panel_size,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=True,  # panel doesn't move
+                    kinematic_enabled=True,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
                 visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.5, 0.5, 0.5),  # grey panel
+                    diffuse_color=(0.2, 0.2, 0.2),  # dark grey panel
                 ),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(self.cfg.panel_distance, 0.0, self.cfg.panel_height),
+                pos=(self.cfg.panel_distance, 0.0, panel_z),
             ),
         )
         self.panel = RigidObject(panel_cfg)
 
         # Spawn buttons as small colored cylinders on the panel
         # Colors: red, blue, green, yellow
+        # Using emissive_color ensures buttons are visible in all render modes
         button_colors = [
             (1.0, 0.0, 0.0),  # red
             (0.0, 0.0, 1.0),  # blue
@@ -242,36 +256,39 @@ class PressEnv(DirectRLEnv):
             (1.0, 1.0, 0.0),  # yellow
         ]
 
-        self.buttons = []
-        spacing = self.cfg.panel_size[0] / 3
-        offsets = [
-            (-spacing / 2,  spacing / 2),
-            ( spacing / 2,  spacing / 2),
-            (-spacing / 2, -spacing / 2),
-            ( spacing / 2, -spacing / 2),
+        # 2x2 grid of vertical cylinders on top of flat panel
+        y_spacing = self.cfg.button_h_spacing
+        x_spacing = self.cfg.button_v_spacing
+        btn_offsets = [
+            (-x_spacing / 2, -y_spacing / 2),  # button 0: far-left
+            (-x_spacing / 2,  y_spacing / 2),  # button 1: far-right
+            ( x_spacing / 2, -y_spacing / 2),  # button 2: near-left
+            ( x_spacing / 2,  y_spacing / 2),  # button 3: near-right
         ]
 
+        self.buttons = []
         for i in range(self.cfg.num_buttons):
             btn_cfg = RigidObjectCfg(
                 prim_path=f"/World/envs/env_.*/Button_{i}",
                 spawn=sim_utils.CylinderCfg(
                     radius=self.cfg.button_radius,
-                    height=self.cfg.button_depth,
+                    height=self.cfg.button_height,
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        kinematic_enabled=True,  # buttons are fixed
+                        kinematic_enabled=True,
                     ),
                     collision_props=sim_utils.CollisionPropertiesCfg(),
                     visual_material=sim_utils.PreviewSurfaceCfg(
                         diffuse_color=button_colors[i],
+                        emissive_color=button_colors[i],
                     ),
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(
-                        self.cfg.panel_distance - self.cfg.panel_size[2] / 2 - self.cfg.button_depth / 2,
-                        offsets[i][0],
-                        self.cfg.panel_height + offsets[i][1],
+                        self.cfg.panel_distance + btn_offsets[i][0],  # x: fore-aft on panel
+                        btn_offsets[i][1],                             # y: lateral
+                        self.cfg.button_center_z,                      # z: on top of panel
                     ),
-                    rot=(0.707, 0.0, 0.707, 0.0),  # rotate cylinder to face robot
+                    # No rotation — default cylinder is already vertical
                 ),
             )
             self.buttons.append(RigidObject(btn_cfg))
@@ -371,23 +388,30 @@ class PressEnv(DirectRLEnv):
         """
         base_pos = self.robot.data.root_pos_w  # (num_envs, 3)
 
+        # FR calf world position — used for contact detection
+        # body_pos_w: (num_envs, num_bodies, 3)
+        fr_foot_pos = self.robot.data.body_pos_w[:, self.fr_foot_idx, :]  # (num_envs, 3)
+
         # Target button world position
         target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         for env_id in range(self.num_envs):
             target_pos[env_id] = self.button_positions[env_id, self.target_button_idx[env_id]]
         target_pos_world = target_pos + self.scene.env_origins
 
-        # 1. Distance reward
-        dist = torch.norm(base_pos - target_pos_world, dim=-1)
+        # 1. Distance reward — use FR calf distance to target, not base distance.
+        #    This rewards the leg actually reaching the button rather than the
+        #    torso being close to the panel.
+        dist = torch.norm(fr_foot_pos - target_pos_world, dim=-1)
         reward_dist = self.cfg.reward_distance_weight * dist
 
-        # 2. Contact detection (proximity-based; Phase 4 will upgrade to ContactSensor)
+        # 2. Contact detection: FR calf proximity to each button
+        #    (Phase 4 will upgrade to Isaac Lab ContactSensor for force-based detection)
         reward_contact = torch.zeros(self.num_envs, device=self.device)
-        contact_threshold = self.cfg.button_radius * 3
+        contact_threshold = self.cfg.button_radius * 3  # 0.06m
 
         for btn_id in range(self.cfg.num_buttons):
             btn_pos = self.button_positions[:, btn_id] + self.scene.env_origins
-            btn_dist = torch.norm(base_pos - btn_pos, dim=-1)
+            btn_dist = torch.norm(fr_foot_pos - btn_pos, dim=-1)
             in_contact = btn_dist < contact_threshold
 
             is_target = (self.target_button_idx == btn_id)
@@ -418,8 +442,11 @@ class PressEnv(DirectRLEnv):
             target_pos[env_id] = self.button_positions[env_id, self.target_button_idx[env_id]]
         target_pos_world = target_pos + self.scene.env_origins
 
-        base_pos = self.robot.data.root_pos_w
-        dist_to_target = torch.norm(base_pos - target_pos_world, dim=-1)
+        # Use FR calf position for success detection — measures whether the
+        # pressing leg actually reached the button, not just whether the torso
+        # is close to the panel.
+        fr_foot_pos = self.robot.data.body_pos_w[:, self.fr_foot_idx, :]
+        dist_to_target = torch.norm(fr_foot_pos - target_pos_world, dim=-1)
         success = dist_to_target < (self.cfg.button_radius * 3)
 
         terminated = fell_over | success
