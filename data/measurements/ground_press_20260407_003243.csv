@@ -1,0 +1,1 @@
+timestamp_s,step,cmd_hip_offset,cmd_thigh_offset,cmd_calf_offset,fr_hip_actual,fr_thigh_actual,fr_calf_actual,foot_x_m,foot_y_m,foot_z_m,foot_force_fr,imu_roll,imu_pitch,note

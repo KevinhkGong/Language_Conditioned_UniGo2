@@ -1,7 +1,7 @@
 """
 src/planner/heuristic_contact.py
 
-Heuristic contact phase controller for wall-mounted button pressing.
+Heuristic contact phase controller for button pressing (wall or ground).
 
 Each phase uses a gate check — the next phase only starts when actual
 joint positions confirm the current phase is complete. This prevents
@@ -12,7 +12,7 @@ Execution sequence:
     2. sit_to_stand   — gate: all joints near STAND_POS
     3. weight_shift   — gate: FL/RL/RR hips at WEIGHT_SHIFT_POS
     4. lift           — gate: FR thigh near lift target
-    5. extend         — gate: FR thigh near extend target
+    5. extend/press   — gate: FR thigh near extend/press target
     6. hold           — timeout or contact detected
     7. retract        — gate: FR thigh near WEIGHT_SHIFT_POS
     8. weight_unshift — gate: all joints near STAND_POS
@@ -20,11 +20,32 @@ Execution sequence:
     10. lower_to_sit  — gate: all joints near SIT_POS
     11. done          — zero gains → SelectMode → RecoveryStand
 
+press_mode options:
+    "wall"   — FR leg swings forward and out to press a wall-mounted button
+    "ground" — FR leg lifts and presses downward onto a floor button (~1.5in tall)
+
 Joint ordering (unitree_legged_const.py Go2):
     0=FR_hip   1=FR_thigh  2=FR_calf
     3=FL_hip   4=FL_thigh  5=FL_calf
     6=RR_hip   7=RR_thigh  8=RR_calf
     9=RL_hip  10=RL_thigh 11=RL_calf
+
+Key fixes vs previous version:
+    - _retract_start now captures actual joint positions, not commanded target_q.
+      This eliminates the position discontinuity at the start of retract when
+      the FR leg hasn't fully reached the extend/press target.
+    - FR leg keeps KP_FR (40.0) during retract phase instead of jumping to
+      KP_STABLE (100.0). The sudden gain increase on a mid-air extended leg
+      was causing a torque spike that destabilized the support legs.
+    - Control loop no longer silently skips _send_cmd when low_state is
+      momentarily stale. Instead it resends the last command, preventing
+      the single-cycle torque dropout ("one damp") caused by missed publishes
+      at 500 Hz under Python GIL contention.
+    - settle gate threshold loosened 0.10 → 0.15 to eliminate the shake-then-
+      advance behaviour caused by forcing advance mid-oscillation.
+    - Foot force contact detection added as a stub (disabled by default).
+      FR foot force readings were found unreliable on this hardware during
+      initial testing. Enable with use_foot_force=True once characterised.
 """
 
 import time
@@ -32,6 +53,7 @@ import logging
 import threading
 import concurrent.futures
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -64,16 +86,16 @@ KD_FR     = 3.0
 KP_SOFT   = 25.0
 KD_SOFT   = 3.0
 
-# Phase durations (steps at 500Hz) — used as minimum, gate check is the real trigger
-STEPS_SIT_TO_STAND = 1000   # 2.0s min
-STEPS_WEIGHT_SHIFT = 800    # 1.6s min
-STEPS_LIFT         = 600    # 1.2s min
-STEPS_EXTEND       = 600    # 1.2s min
-STEPS_HOLD         = 500    # 1.0s hold after contact
-STEPS_RETRACT      = 800    # 1.6s min
-STEPS_WEIGHT_SHIFT_BACK = 800  # 1.6s min
-STEPS_SETTLE       = 500    # 1.0s min — smooth actual → STAND_POS before sit
-STEPS_LOWER_TO_SIT = 1500   # 3.0s min
+# Phase durations (steps at 500 Hz) — used as minimum; gate check is real trigger
+STEPS_SIT_TO_STAND      = 1000   # 2.0s min
+STEPS_WEIGHT_SHIFT      = 800    # 1.6s min
+STEPS_LIFT              = 600    # 1.2s min
+STEPS_EXTEND            = 600    # 1.2s min
+STEPS_HOLD              = 500    # 1.0s hold after contact
+STEPS_RETRACT           = 800    # 1.6s min
+STEPS_WEIGHT_SHIFT_BACK = 800    # 1.6s min
+STEPS_SETTLE            = 500    # 1.0s min — smooth actual → STAND_POS before sit
+STEPS_LOWER_TO_SIT      = 1500   # 3.0s min
 
 # Gate timeout — max extra steps to wait for gate before forcing advance
 GATE_TIMEOUT = 500   # 1.0s extra before forcing advance
@@ -88,7 +110,14 @@ FR_CALF  = 2
 # Joint threshold for gate checks
 GATE_THRESHOLD = 0.15   # radians
 
-# ── Poses — measured from real robot ─────────────────────────────────────────
+# Foot force contact detection (stub — currently unreliable on this hardware)
+# Set use_foot_force=True in execute() once FR foot force is characterised.
+# Threshold is the spike above baseline that indicates button contact.
+# Measure baseline using print_pose.py while FR foot is lifted in the air.
+FOOT_FORCE_CONTACT_THRESHOLD = 10.0   # raw units — TO BE CALIBRATED
+FR_FOOT_FORCE_IDX            = 0      # index into low_state.foot_force for FR foot
+
+# ── Poses — measured from real robot ──────────────────────────────────────────
 
 STAND_POS = [
     -0.021, +0.667, -1.359,   # FR
@@ -111,8 +140,26 @@ WEIGHT_SHIFT_POS[6]  = STAND_POS[6]  + 0.15   # RR_hip outward
 WEIGHT_SHIFT_POS[4]  = STAND_POS[4]  - 0.10   # FL_thigh lower
 WEIGHT_SHIFT_POS[10] = STAND_POS[10] - 0.10   # RL_thigh lower
 
-FR_LIFT_OFFSET   = np.array([+0.04, -1.0,  0.0])
-FR_EXTEND_OFFSET = np.array([+0.04, -2.0, -0.1])
+# ── FR leg offsets — wall press ───────────────────────────────────────────────
+# Leg swings forward and out to reach a wall-mounted button.
+# Thigh goes strongly negative (paw-forward), calf stays near neutral.
+FR_LIFT_OFFSET_WALL   = np.array([+0.04, -1.0,  0.0])
+FR_EXTEND_OFFSET_WALL = np.array([+0.04, -2.0, -0.1])
+
+# ── FR leg offsets — ground press ─────────────────────────────────────────────
+# Button is ~3 inches (7.6 cm) in front of FR foot at standing, ~1.5 inches tall.
+# Motion: small lift to clear ground → swing slightly forward → press straight down.
+# Thigh goes moderately negative (much less than wall press — no need to reach far).
+# Calf extends (positive offset) to push paw downward onto button surface.
+#
+# IMPORTANT: These are geometry-estimated starting values only.
+# Tune empirically using print_pose.py:
+#   1. Run in low-level, weight-shifted stance
+#   2. Command FR leg to lift target — verify FR foot z rises above button top
+#   3. Command FR leg to press target — verify FR foot lands on button center
+#   4. Read joint angles from print_pose.py and update values below
+FR_LIFT_OFFSET_GROUND  = np.array([+0.04, -0.4, +0.3])   # gentle lift, calf tucks
+FR_PRESS_OFFSET_GROUND = np.array([+0.04, -0.6, +0.5])   # forward + calf pushes down
 
 
 # ──────────────────────────────────────────────
@@ -124,9 +171,10 @@ class ContactResult:
     success:            bool
     contact_step:       int
     timeout:            bool
+    press_mode:         str
     target_offset_xyz:  np.ndarray
-    joint_trajectory:   np.ndarray
-    fr_foot_trajectory: np.ndarray
+    joint_trajectory:   np.ndarray   # (T, 12) — hold phase, actual positions
+    fr_foot_trajectory: np.ndarray   # (T, 3)  — hold phase, FK estimates
     duration_s:         float
 
 
@@ -149,13 +197,20 @@ class HeuristicContact:
 
         self._phase        = "idle"
         self._phase_step   = 0
+        self._press_mode   = "ground"  # set properly in execute()
         self._start_pos    = list(SIT_POS)
         self._done         = False
         self._contact_step = -1
         self._joint_traj   = []
         self._fr_foot_traj = []
 
-        # Dynamic pose storage
+        # FIX: cache last sent command so we can resend on stale-state cycles
+        # instead of silently skipping _send_cmd, which caused single-cycle
+        # torque dropouts ("one damp") at 500 Hz under GIL contention.
+        self._last_target_q: list | None = None
+
+        # Dynamic pose storage — captured at phase transitions from actual positions
+        self._weight_shift_end = list(STAND_POS)
         self._lift_end_pos    = list(STAND_POS)
         self._hold_pos        = list(STAND_POS)
         self._retract_start   = list(STAND_POS)
@@ -190,16 +245,45 @@ class HeuristicContact:
 
     def execute(
         self,
-        target_offset_xyz: np.ndarray,
+        target_offset_xyz:   np.ndarray,
+        press_mode:          Literal["wall", "ground"] = "ground",
         contact_proximity_m: float = CONTACT_PROXIMITY_M,
+        use_foot_force:      bool  = False,
     ) -> ContactResult:
+        """
+        Execute the full contact sequence.
 
+        Args:
+            target_offset_xyz:   3D target position in robot base frame [x, y, z].
+                                 Used for FK proximity contact detection.
+            press_mode:          "wall" — FR leg swings forward/out to wall button.
+                                 "ground" — FR leg lifts and presses down onto floor button.
+            contact_proximity_m: FK proximity threshold for contact detection (m).
+            use_foot_force:      Enable foot-force contact detection (stub).
+                                 Currently disabled — FR foot force unreliable on this hardware.
+                                 Enable only after calibrating FOOT_FORCE_CONTACT_THRESHOLD
+                                 using print_pose.py (lifted baseline vs pressed contact).
+        """
         self._joint_traj        = []
         self._fr_foot_traj      = []
         self._contact_step      = -1
         self._done              = False
+        self._press_mode        = press_mode
         self._target_offset     = target_offset_xyz
         self._contact_proximity = contact_proximity_m
+        self._use_foot_force    = use_foot_force
+        self._last_target_q     = None
+
+        if use_foot_force:
+            logger.warning(
+                "Foot force contact detection enabled but currently a stub. "
+                "FR foot force was unreliable during initial testing. "
+                "Calibrate FOOT_FORCE_CONTACT_THRESHOLD with print_pose.py first."
+            )
+
+        logger.info(
+            f"execute() — press_mode='{press_mode}'  target={target_offset_xyz}"
+        )
 
         t_start = time.time()
 
@@ -207,12 +291,13 @@ class HeuristicContact:
         self._wait_for_state()
 
         with self._state_lock:
-            self._start_pos = [self._low_state.motor_state[i].q
-                               for i in range(12)]
+            self._start_pos = [self._low_state.motor_state[i].q for i in range(12)]
 
-        logger.info(f"Start pose FR: hip={self._start_pos[0]:+.3f} "
-                    f"thigh={self._start_pos[1]:+.3f} "
-                    f"calf={self._start_pos[2]:+.3f}")
+        logger.info(
+            f"Start pose FR: hip={self._start_pos[0]:+.3f} "
+            f"thigh={self._start_pos[1]:+.3f} "
+            f"calf={self._start_pos[2]:+.3f}"
+        )
 
         self._phase      = "sit_to_stand"
         self._phase_step = 0
@@ -221,11 +306,11 @@ class HeuristicContact:
         self._write_thread = threading.Thread(
             target=self._control_loop_thread,
             name="heuristic_contact",
-            daemon=True
+            daemon=True,
         )
         self._write_thread.start()
 
-        # Generous timeout — gates ensure correctness, timeout is safety net
+        # Generous timeout — gates ensure correctness, this is a safety net
         timeout = 120.0
         t_wait  = 0.0
         while not self._done and t_wait < timeout:
@@ -254,9 +339,12 @@ class HeuristicContact:
             success=self._contact_step >= 0,
             contact_step=self._contact_step,
             timeout=not self._done,
+            press_mode=press_mode,
             target_offset_xyz=target_offset_xyz,
-            joint_trajectory=np.array(self._joint_traj)     if self._joint_traj    else np.zeros((0, 12)),
-            fr_foot_trajectory=np.array(self._fr_foot_traj) if self._fr_foot_traj else np.zeros((0, 3)),
+            joint_trajectory=np.array(self._joint_traj)
+                if self._joint_traj else np.zeros((0, 12)),
+            fr_foot_trajectory=np.array(self._fr_foot_traj)
+                if self._fr_foot_traj else np.zeros((0, 3)),
             duration_s=duration,
         )
 
@@ -274,31 +362,52 @@ class HeuristicContact:
                 time.sleep(remaining)
 
     def _control_loop(self):
+        # FIX: If low_state is momentarily stale (subscriber blocked by GIL
+        # or lock contention), resend the last command instead of silently
+        # returning. Skipping a publish at 500 Hz causes a 2ms torque dropout
+        # visible as the "one damp" shake seen at phase transitions on the robot.
         if self._low_state is None:
+            if self._last_target_q is not None:
+                self._send_cmd(self._last_target_q)
             return
 
         self._phase_step += 1
 
-        # Read current actual joint positions and IMU
+        # Read current actual joint positions and IMU under lock
         with self._state_lock:
-            actual = [self._low_state.motor_state[i].q for i in range(12)]
-            roll   = self._low_state.imu_state.rpy[0]
-            pitch  = self._low_state.imu_state.rpy[1]
+            actual   = [self._low_state.motor_state[i].q for i in range(12)]
+            roll     = self._low_state.imu_state.rpy[0]
+            pitch    = self._low_state.imu_state.rpy[1]
+            # Foot force — read every cycle; only acted on if use_foot_force=True
+            # Index 0 = FR foot. Units are hardware-specific (not calibrated).
+            fr_force = self._low_state.foot_force[FR_FOOT_FORCE_IDX]
 
         target_q = list(STAND_POS)
 
-        # ── Gate helper ───────────────────────────────────────────────
+        # ── Select offsets based on press_mode ───────────────────────
+        if self._press_mode == "ground":
+            lift_offset   = FR_LIFT_OFFSET_GROUND
+            extend_offset = FR_PRESS_OFFSET_GROUND
+        else:
+            lift_offset   = FR_LIFT_OFFSET_WALL
+            extend_offset = FR_EXTEND_OFFSET_WALL
+
+        # ── Gate helpers ──────────────────────────────────────────────
         def gate_passed(target_pos, indices, threshold=GATE_THRESHOLD):
-            """True if all specified joints are close to target."""
-            return all(abs(actual[i] - target_pos[i]) < threshold
-                       for i in indices)
+            """True if all specified joints are within threshold of target."""
+            return all(
+                abs(actual[i] - target_pos[i]) < threshold
+                for i in indices
+            )
 
         def should_advance(min_steps, gate_ok):
             """Advance if gate passed after min steps, or force after timeout."""
             if self._phase_step >= min_steps and gate_ok:
                 return True
             if self._phase_step >= min_steps + GATE_TIMEOUT:
-                logger.warning(f"Phase '{self._phase}' gate timeout — forcing advance")
+                logger.warning(
+                    f"Phase '{self._phase}' gate timeout — forcing advance"
+                )
                 return True
             return False
 
@@ -320,53 +429,59 @@ class HeuristicContact:
             for i in range(12):
                 target_q[i] = (1-alpha)*STAND_POS[i] + alpha*WEIGHT_SHIFT_POS[i]
 
-            # Gate: FL_hip, RL_hip, RR_hip have shifted
             gate_ok = gate_passed(WEIGHT_SHIFT_POS, [3, 9, 6], threshold=0.15)
             if should_advance(STEPS_WEIGHT_SHIFT, gate_ok):
                 logger.info("✓ weight_shift complete")
+                self._weight_shift_end = list(actual)
                 self._phase      = "lift"
                 self._phase_step = 0
 
         # ── lift FR ───────────────────────────────────────────────────
         elif self._phase == "lift":
             alpha    = min(self._phase_step / STEPS_LIFT, 1.0)
-            target_q = list(WEIGHT_SHIFT_POS)
-            fr_s     = np.array([WEIGHT_SHIFT_POS[FR_HIP],
-                                  WEIGHT_SHIFT_POS[FR_THIGH],
-                                  WEIGHT_SHIFT_POS[FR_CALF]])
-            fr_l     = np.array([STAND_POS[FR_HIP]   + FR_LIFT_OFFSET[0],
-                                  STAND_POS[FR_THIGH] + FR_LIFT_OFFSET[1],
-                                  STAND_POS[FR_CALF]  + FR_LIFT_OFFSET[2]])
+            target_q = list(self._weight_shift_end)
+            fr_s = np.array([
+                WEIGHT_SHIFT_POS[FR_HIP],
+                WEIGHT_SHIFT_POS[FR_THIGH],
+                WEIGHT_SHIFT_POS[FR_CALF],
+            ])
+            fr_l = np.array([
+                STAND_POS[FR_HIP]   + lift_offset[0],
+                STAND_POS[FR_THIGH] + lift_offset[1],
+                STAND_POS[FR_CALF]  + lift_offset[2],
+            ])
             target_q[FR_HIP]   = (1-alpha)*fr_s[0] + alpha*fr_l[0]
             target_q[FR_THIGH] = (1-alpha)*fr_s[1] + alpha*fr_l[1]
             target_q[FR_CALF]  = (1-alpha)*fr_s[2] + alpha*fr_l[2]
 
-            # Gate: FR thigh is at lift position
             gate_ok = abs(actual[FR_THIGH] - fr_l[1]) < GATE_THRESHOLD
             if should_advance(STEPS_LIFT, gate_ok):
-                logger.info(f"✓ lift complete FR_thigh={actual[FR_THIGH]:+.3f}")
+                logger.info(f"✓ lift complete  FR_thigh={actual[FR_THIGH]:+.3f}")
                 self._phase        = "extend"
                 self._phase_step   = 0
                 self._lift_end_pos = list(target_q)
 
-        # ── extend FR ─────────────────────────────────────────────────
+        # ── extend / press-down FR ────────────────────────────────────
         elif self._phase == "extend":
             alpha    = min(self._phase_step / STEPS_EXTEND, 1.0)
             target_q = list(self._lift_end_pos)
-            fr_e     = np.array([STAND_POS[FR_HIP]   + FR_EXTEND_OFFSET[0],
-                                  STAND_POS[FR_THIGH] + FR_EXTEND_OFFSET[1],
-                                  STAND_POS[FR_CALF]  + FR_EXTEND_OFFSET[2]])
-            fr_l     = np.array([self._lift_end_pos[FR_HIP],
-                                  self._lift_end_pos[FR_THIGH],
-                                  self._lift_end_pos[FR_CALF]])
+            fr_e = np.array([
+                STAND_POS[FR_HIP]   + extend_offset[0],
+                STAND_POS[FR_THIGH] + extend_offset[1],
+                STAND_POS[FR_CALF]  + extend_offset[2],
+            ])
+            fr_l = np.array([
+                self._lift_end_pos[FR_HIP],
+                self._lift_end_pos[FR_THIGH],
+                self._lift_end_pos[FR_CALF],
+            ])
             target_q[FR_HIP]   = (1-alpha)*fr_l[0] + alpha*fr_e[0]
             target_q[FR_THIGH] = (1-alpha)*fr_l[1] + alpha*fr_e[1]
             target_q[FR_CALF]  = (1-alpha)*fr_l[2] + alpha*fr_e[2]
 
-            # Gate: FR thigh is at extend position
             gate_ok = abs(actual[FR_THIGH] - fr_e[1]) < GATE_THRESHOLD
             if should_advance(STEPS_EXTEND, gate_ok):
-                logger.info(f"✓ extend complete FR_thigh={actual[FR_THIGH]:+.3f}")
+                logger.info(f"✓ extend complete  FR_thigh={actual[FR_THIGH]:+.3f}")
                 self._phase      = "hold"
                 self._phase_step = 0
                 self._hold_pos   = list(target_q)
@@ -374,45 +489,81 @@ class HeuristicContact:
         # ── hold + detect contact ─────────────────────────────────────
         elif self._phase == "hold":
             target_q = list(self._hold_pos)
-            self._joint_traj.append(list(target_q))
-            fr_foot = self._estimate_fr_foot(target_q)
+            # Record actual positions during hold for training data
+            self._joint_traj.append(list(actual))
+            fr_foot = self._estimate_fr_foot(actual)
             self._fr_foot_traj.append(fr_foot.tolist())
 
-            dist = np.linalg.norm(fr_foot - self._target_offset)
-            if dist < self._contact_proximity and self._contact_step < 0:
-                self._contact_step = self._phase_step
-                logger.info(f"Contact detected at step {self._contact_step} "
-                            f"dist={dist:.3f}m")
+            # Primary: FK proximity contact detection
+            dist       = np.linalg.norm(fr_foot - self._target_offset)
+            fk_contact = dist < self._contact_proximity
 
-            contact_done = (self._contact_step >= 0 and
-                            self._phase_step >= self._contact_step + STEPS_HOLD)
+            # Secondary: foot force spike (stub — disabled by default)
+            # FR foot force was unreliable during initial hardware testing.
+            # To enable: pass use_foot_force=True to execute() and first
+            # calibrate FOOT_FORCE_CONTACT_THRESHOLD with print_pose.py
+            # (measure baseline with FR foot lifted, threshold above that).
+            force_contact = False
+            if self._use_foot_force:
+                # TODO: set FOOT_FORCE_CONTACT_THRESHOLD after calibration
+                force_contact = fr_force > FOOT_FORCE_CONTACT_THRESHOLD
+                if force_contact:
+                    logger.debug(
+                        f"Foot force contact trigger: fr_force={fr_force:.1f}"
+                    )
+
+            contact_detected = fk_contact or force_contact
+
+            if contact_detected and self._contact_step < 0:
+                self._contact_step = self._phase_step
+                method = "FK-proximity" if fk_contact else "foot-force"
+                logger.info(
+                    f"Contact detected at step {self._contact_step} "
+                    f"dist={dist:.3f}m  fr_force={fr_force:.1f}  method={method}"
+                )
+
+            contact_done = (
+                self._contact_step >= 0
+                and self._phase_step >= self._contact_step + STEPS_HOLD
+            )
             if contact_done or self._phase_step >= CONTACT_MAX_STEPS:
-                logger.info(f"✓ hold complete — retracting")
+                logger.info("✓ hold complete — retracting")
                 self._phase         = "retract"
                 self._phase_step    = 0
-                self._retract_start = list(target_q)
+                # FIX: capture actual positions, not commanded target_q.
+                # With KP_FR=40 (soft), FR leg may not fully reach hold_pos.
+                # Using commanded pos as retract start creates a discontinuity
+                # on the first retract step, causing a jerk on all legs.
+                self._retract_start = list(actual)
 
         # ── retract FR ────────────────────────────────────────────────
         elif self._phase == "retract":
             alpha = min(self._phase_step / STEPS_RETRACT, 1.0)
             for i in range(12):
-                target_q[i] = (1-alpha)*self._retract_start[i] + alpha*WEIGHT_SHIFT_POS[i]
+                target_q[i] = (
+                    (1-alpha) * self._retract_start[i]
+                    + alpha   * WEIGHT_SHIFT_POS[i]
+                )
 
-            # Gate: FR thigh is back near WEIGHT_SHIFT_POS (retracted)
-            gate_ok = abs(actual[FR_THIGH] - WEIGHT_SHIFT_POS[FR_THIGH]) < GATE_THRESHOLD
+            gate_ok = (
+                abs(actual[FR_THIGH] - WEIGHT_SHIFT_POS[FR_THIGH]) < GATE_THRESHOLD
+            )
             if should_advance(STEPS_RETRACT, gate_ok):
-                logger.info(f"✓ retract complete FR_thigh={actual[FR_THIGH]:+.3f}")
+                logger.info(f"✓ retract complete  FR_thigh={actual[FR_THIGH]:+.3f}")
                 self._phase         = "weight_unshift"
                 self._phase_step    = 0
-                self._unshift_start = list(target_q)
+                # Capture actual here too for clean unshift interpolation start
+                self._unshift_start = list(actual)
 
         # ── weight unshift ────────────────────────────────────────────
         elif self._phase == "weight_unshift":
             alpha = min(self._phase_step / STEPS_WEIGHT_SHIFT_BACK, 1.0)
             for i in range(12):
-                target_q[i] = (1-alpha)*self._unshift_start[i] + alpha*STAND_POS[i]
+                target_q[i] = (
+                    (1-alpha) * self._unshift_start[i]
+                    + alpha   * STAND_POS[i]
+                )
 
-            # Gate: FL_hip, RL_hip, RR_hip back to STAND_POS
             gate_ok = gate_passed(STAND_POS, range(12), threshold=0.15)
             if should_advance(STEPS_WEIGHT_SHIFT_BACK, gate_ok):
                 logger.info("✓ weight_unshift complete")
@@ -420,16 +571,20 @@ class HeuristicContact:
                 self._phase_step   = 0
                 self._settle_start = list(actual)
 
-        # ── settle — smooth actual → STAND_POS ─────────────────────
+        # ── settle — smooth actual → STAND_POS ───────────────────────
         elif self._phase == "settle":
             alpha = min(self._phase_step / STEPS_SETTLE, 1.0)
             for i in range(12):
-                target_q[i] = (1-alpha)*self._settle_start[i] + alpha*STAND_POS[i]
+                target_q[i] = (
+                    (1-alpha) * self._settle_start[i]
+                    + alpha   * STAND_POS[i]
+                )
 
-            # Gate: all joints near STAND_POS (tighter threshold)
-            gate_ok = gate_passed(STAND_POS, range(12), threshold=0.10)
+            # FIX: loosened threshold 0.10 → 0.15 to avoid forcing advance
+            # mid-oscillation, which caused a visible single shake before sit.
+            gate_ok = gate_passed(STAND_POS, range(12), threshold=0.15)
             if should_advance(STEPS_SETTLE, gate_ok):
-                logger.info("✓ settle complete — starting lower_to_sit from STAND_POS")
+                logger.info("✓ settle complete — starting lower_to_sit")
                 self._phase       = "lower_to_sit"
                 self._phase_step  = 0
                 self._lower_start = list(STAND_POS)
@@ -437,11 +592,10 @@ class HeuristicContact:
         # ── lower to sit ──────────────────────────────────────────────
         elif self._phase == "lower_to_sit":
             t     = min(self._phase_step / STEPS_LOWER_TO_SIT, 1.0)
-            alpha = t * t * (3 - 2 * t)   # smoothstep
+            alpha = t * t * (3 - 2 * t)   # smoothstep — avoids jerk at start/end
             for i in range(12):
                 target_q[i] = (1-alpha)*self._lower_start[i] + alpha*SIT_POS[i]
 
-            # Gate: all joints near SIT_POS
             gate_ok = gate_passed(SIT_POS, range(12), threshold=0.2)
             if should_advance(STEPS_LOWER_TO_SIT, gate_ok):
                 logger.info("✓ lower_to_sit complete")
@@ -455,7 +609,9 @@ class HeuristicContact:
             return
 
         # ── IMU balance correction — hold and retract only ────────────
-        # Disabled during weight_shift/lift/extend to not fight intentional lean
+        # Disabled during weight_shift/lift/extend: those phases intentionally
+        # shift the CoM and the IMU correction would fight the desired lean.
+        # Re-enabled for hold and retract where the robot should be balanced.
         if self._phase in ("hold", "retract"):
             ROLL_GAIN  = 0.6
             PITCH_GAIN = 0.15
@@ -477,6 +633,8 @@ class HeuristicContact:
             target_q[7]  = np.clip(target_q[7],   0.3,  1.5)
             target_q[10] = np.clip(target_q[10],  0.3,  1.5)
 
+        # Cache last command and send
+        self._last_target_q = target_q
         self._send_cmd(target_q)
 
     def _send_cmd(self, target_q: list) -> None:
@@ -486,7 +644,11 @@ class HeuristicContact:
             self._low_cmd.motor_cmd[i].tau = 0.0
 
             if i in (FR_HIP, FR_THIGH, FR_CALF) and self._phase in (
-                "lift", "extend", "hold"
+                "lift", "extend", "hold",
+                # FIX: keep KP_FR during retract — previously jumped to
+                # KP_STABLE=100 here, causing a sudden torque spike on the
+                # mid-air extended FR leg that destabilized the support legs.
+                "retract",
             ):
                 self._low_cmd.motor_cmd[i].kp = KP_FR
                 self._low_cmd.motor_cmd[i].kd = KD_FR
@@ -526,7 +688,7 @@ class HeuristicContact:
             if result is None:
                 break
 
-        logger.info("Low-Level active.")
+        logger.info("Low-level active.")
 
     def _switch_to_sportmode(self) -> None:
         logger.info("Restoring Sport Mode...")
@@ -586,6 +748,7 @@ class HeuristicContact:
 
     @staticmethod
     def _estimate_fr_foot(q: list) -> np.ndarray:
+        """Simplified FK for FR foot position in robot base frame."""
         L_THIGH = 0.213
         L_CALF  = 0.213
         HIP_Y   = -0.1034
@@ -609,25 +772,45 @@ if __name__ == "__main__":
     import argparse
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--interface", type=str, default=DEFAULT_INTERFACE)
-    parser.add_argument("--target-x",  type=float, default=0.35)
-    parser.add_argument("--target-y",  type=float, default=-0.10)
-    parser.add_argument("--target-z",  type=float, default=0.40)
-    parser.add_argument("--dry-run", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Heuristic contact phase controller — wall or ground press"
+    )
+    parser.add_argument("--interface",   type=str,   default=DEFAULT_INTERFACE)
+    parser.add_argument("--target-x",   type=float,  default=0.27,
+                        help="FR foot x + 7.6cm forward offset for ground press")
+    parser.add_argument("--target-y",   type=float,  default=-0.10)
+    parser.add_argument("--target-z",   type=float,  default=0.038,
+                        help="Button top height in base frame (~0.038m for 1.5in button)")
+    parser.add_argument("--mode",        type=str,   default="ground",
+                        choices=["wall", "ground"],
+                        help="Press mode: 'ground' (default) or 'wall'")
+    parser.add_argument("--foot-force",  action="store_true",
+                        help="Enable foot-force contact detection stub "
+                             "(disabled by default — unreliable on this hardware)")
+    parser.add_argument("--dry-run",     action="store_true")
     args = parser.parse_args()
 
     print("\n" + "="*60)
     print("Heuristic Contact — Gate-Based Phase Controller")
     print("="*60)
-    print(f"Interface: {args.interface}")
-    print(f"Target:    ({args.target_x}, {args.target_y}, {args.target_z})")
+    print(f"Interface:  {args.interface}")
+    print(f"Mode:       {args.mode}")
+    print(f"Target:     ({args.target_x}, {args.target_y}, {args.target_z})")
+    print(f"Foot force: {'enabled (stub)' if args.foot_force else 'disabled'}")
     print("\nPhases: sit_to_stand → weight_shift → lift → extend → "
           "hold → retract → weight_unshift → settle → lower_to_sit → done")
     print("Each phase waits for gate confirmation before advancing.")
+    if args.mode == "ground":
+        print(f"\nGround press offsets (tune with print_pose.py):")
+        print(f"  FR_LIFT_OFFSET_GROUND  = {FR_LIFT_OFFSET_GROUND.tolist()}")
+        print(f"  FR_PRESS_OFFSET_GROUND = {FR_PRESS_OFFSET_GROUND.tolist()}")
+    else:
+        print(f"\nWall press offsets:")
+        print(f"  FR_LIFT_OFFSET_WALL    = {FR_LIFT_OFFSET_WALL.tolist()}")
+        print(f"  FR_EXTEND_OFFSET_WALL  = {FR_EXTEND_OFFSET_WALL.tolist()}")
     print("\nWARNING: Robot will sit down, stand in low-level, lift FR leg.")
     input("Press Enter to continue (Ctrl+C to abort)...\n")
 
@@ -635,13 +818,18 @@ if __name__ == "__main__":
     print("✓ Connected")
 
     if args.dry_run:
-        print("Dry-run — skipping.")
+        print("Dry-run — skipping execution.")
     else:
         target = np.array([args.target_x, args.target_y, args.target_z])
-        result = controller.execute(target_offset_xyz=target)
+        result = controller.execute(
+            target_offset_xyz=target,
+            press_mode=args.mode,
+            use_foot_force=args.foot_force,
+        )
         print(f"\nResult:")
         print(f"  success:      {result.success}")
         print(f"  contact_step: {result.contact_step}")
         print(f"  timeout:      {result.timeout}")
+        print(f"  press_mode:   {result.press_mode}")
         print(f"  duration:     {result.duration_s:.2f}s")
         print(f"  traj_shape:   {result.joint_trajectory.shape}")

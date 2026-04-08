@@ -1,0 +1,2 @@
+timestamp_s,step,cmd_hip,cmd_thigh,cmd_calf,act_hip,act_thigh,act_calf,foot_x,foot_y,foot_z,foot_force_fr,imu_roll,imu_pitch
+17.0323,1,0.0,0.0,1.0,-0.2271,0.4829,-0.8798,0.2099,-0.1007,-0.3851,93,-0.0612,-0.0461
