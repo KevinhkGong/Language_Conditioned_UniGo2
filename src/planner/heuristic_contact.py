@@ -92,6 +92,9 @@ STEPS_WEIGHT_SHIFT      = 800    # 1.6s min
 STEPS_LIFT              = 600    # 1.2s min
 STEPS_EXTEND            = 600    # 1.2s min
 STEPS_HOLD              = 500    # 1.0s hold after contact
+STEPS_RETRACT_CURL      = 400    # 0.8s — calf tucks up clear of button
+STEPS_RETRACT_ROTATE    = 600    # 1.2s — thigh swings back to weight shift
+STEPS_RETRACT_EXTEND    = 400    # 0.8s — calf extends back to weight shift pos
 STEPS_RETRACT           = 800    # 1.6s min
 STEPS_WEIGHT_SHIFT_BACK = 800    # 1.6s min
 STEPS_SETTLE            = 500    # 1.0s min — smooth actual → STAND_POS before sit
@@ -158,8 +161,12 @@ FR_EXTEND_OFFSET_WALL = np.array([+0.04, -2.0, -0.1])
 #   2. Command FR leg to lift target — verify FR foot z rises above button top
 #   3. Command FR leg to press target — verify FR foot lands on button center
 #   4. Read joint angles from print_pose.py and update values below
-FR_LIFT_OFFSET_GROUND  = np.array([+0.04, -0.4, +0.3])   # gentle lift, calf tucks
-FR_PRESS_OFFSET_GROUND = np.array([+0.04, -0.6, +0.5])   # forward + calf pushes down
+FR_LIFT_OFFSET_GROUND  = np.array([+0.04, -0.8, +0.1])   # gentle lift, calf tucks
+FR_PRESS_OFFSET_GROUND = np.array([+0.04, -1.0, +0.8])   # forward + calf pushes down
+
+# How far the calf retracts during the curl step of retract
+# Tucks foot clear of button before rotating leg back
+FR_RETRACT_CURL_CALF_OFFSET = -0.5   # relative to current calf at press position
 
 
 # ──────────────────────────────────────────────
@@ -213,7 +220,9 @@ class HeuristicContact:
         self._weight_shift_end = list(STAND_POS)
         self._lift_end_pos    = list(STAND_POS)
         self._hold_pos        = list(STAND_POS)
-        self._retract_start   = list(STAND_POS)
+        self._retract_start      = list(STAND_POS)
+        self._retract_curl_end   = list(STAND_POS)
+        self._retract_rotate_end = list(STAND_POS)
         self._unshift_start   = list(STAND_POS)
         self._settle_start    = list(STAND_POS)
         self._lower_start     = list(STAND_POS)
@@ -528,7 +537,7 @@ class HeuristicContact:
             )
             if contact_done or self._phase_step >= CONTACT_MAX_STEPS:
                 logger.info("✓ hold complete — retracting")
-                self._phase         = "retract"
+                self._phase         = "retract_curl"
                 self._phase_step    = 0
                 # FIX: capture actual positions, not commanded target_q.
                 # With KP_FR=40 (soft), FR leg may not fully reach hold_pos.
@@ -536,23 +545,55 @@ class HeuristicContact:
                 # on the first retract step, causing a jerk on all legs.
                 self._retract_start = list(actual)
 
-        # ── retract FR ────────────────────────────────────────────────
-        elif self._phase == "retract":
-            alpha = min(self._phase_step / STEPS_RETRACT, 1.0)
-            for i in range(12):
-                target_q[i] = (
-                    (1-alpha) * self._retract_start[i]
-                    + alpha   * WEIGHT_SHIFT_POS[i]
-                )
-
-            gate_ok = (
-                abs(actual[FR_THIGH] - WEIGHT_SHIFT_POS[FR_THIGH]) < GATE_THRESHOLD
+        # ── retract step 1: curl calf up clear of button ──────────────
+        elif self._phase == "retract_curl":
+            alpha    = min(self._phase_step / STEPS_RETRACT_CURL, 1.0)
+            target_q = list(self._retract_start)
+            # Only move the calf — thigh stays at press position
+            curl_calf_target = self._retract_start[FR_CALF] + FR_RETRACT_CURL_CALF_OFFSET
+            target_q[FR_CALF] = (
+                (1-alpha) * self._retract_start[FR_CALF]
+                + alpha   * curl_calf_target
             )
-            if should_advance(STEPS_RETRACT, gate_ok):
-                logger.info(f"✓ retract complete  FR_thigh={actual[FR_THIGH]:+.3f}")
+
+            gate_ok = abs(actual[FR_CALF] - curl_calf_target) < GATE_THRESHOLD
+            if should_advance(STEPS_RETRACT_CURL, gate_ok):
+                logger.info(f"✓ retract_curl complete  FR_calf={actual[FR_CALF]:+.3f}")
+                self._phase           = "retract_rotate"
+                self._phase_step      = 0
+                self._retract_curl_end = list(actual)
+
+        # ── retract step 2: rotate thigh back to weight shift ─────────
+        elif self._phase == "retract_rotate":
+            alpha    = min(self._phase_step / STEPS_RETRACT_ROTATE, 1.0)
+            target_q = list(self._retract_curl_end)
+            # Only move the thigh — calf stays tucked
+            target_q[FR_THIGH] = (
+                (1-alpha) * self._retract_curl_end[FR_THIGH]
+                + alpha   * WEIGHT_SHIFT_POS[FR_THIGH]
+            )
+
+            gate_ok = abs(actual[FR_THIGH] - WEIGHT_SHIFT_POS[FR_THIGH]) < GATE_THRESHOLD
+            if should_advance(STEPS_RETRACT_ROTATE, gate_ok):
+                logger.info(f"✓ retract_rotate complete  FR_thigh={actual[FR_THIGH]:+.3f}")
+                self._phase             = "retract_extend"
+                self._phase_step        = 0
+                self._retract_rotate_end = list(actual)
+
+        # ── retract step 3: extend calf back to weight shift ──────────
+        elif self._phase == "retract_extend":
+            alpha    = min(self._phase_step / STEPS_RETRACT_EXTEND, 1.0)
+            target_q = list(self._retract_rotate_end)
+            target_q[FR_CALF] = (
+                (1-alpha) * self._retract_rotate_end[FR_CALF]
+                + alpha   * WEIGHT_SHIFT_POS[FR_CALF]
+            )
+
+            gate_ok = abs(actual[FR_CALF] - WEIGHT_SHIFT_POS[FR_CALF]) < GATE_THRESHOLD
+            if should_advance(STEPS_RETRACT_EXTEND, gate_ok):
+                logger.info(f"✓ retract_extend complete  FR_calf={actual[FR_CALF]:+.3f}")
                 self._phase         = "weight_unshift"
                 self._phase_step    = 0
-                # Capture actual here too for clean unshift interpolation start
                 self._unshift_start = list(actual)
 
         # ── weight unshift ────────────────────────────────────────────
@@ -612,7 +653,7 @@ class HeuristicContact:
         # Disabled during weight_shift/lift/extend: those phases intentionally
         # shift the CoM and the IMU correction would fight the desired lean.
         # Re-enabled for hold and retract where the robot should be balanced.
-        if self._phase in ("hold", "retract"):
+        if self._phase in ("hold", "retract_curl", "retract_rotate", "retract_extend"):
             ROLL_GAIN  = 0.6
             PITCH_GAIN = 0.15
 
@@ -648,7 +689,7 @@ class HeuristicContact:
                 # FIX: keep KP_FR during retract — previously jumped to
                 # KP_STABLE=100 here, causing a sudden torque spike on the
                 # mid-air extended FR leg that destabilized the support legs.
-                "retract",
+                "retract_curl", "retract_rotate", "retract_extend"
             ):
                 self._low_cmd.motor_cmd[i].kp = KP_FR
                 self._low_cmd.motor_cmd[i].kd = KD_FR
