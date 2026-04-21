@@ -1,0 +1,5 @@
+timestamp,target_x,target_y,target_z,confidence,depth_m,fk_success,fk_contact_step,contact_method,duration_s,human_success,notes
+2026-04-21T18:53:48,0.5621,-0.1880,0.1452,0.956,0.2351,False,-1,none,35.10,n,too left
+2026-04-21T18:55:20,0.5705,-0.1969,0.1901,0.950,0.2435,False,-1,none,31.35,n,Too left and far
+2026-04-21T18:57:01,0.5685,-0.0952,0.2090,0.914,0.2415,False,-1,none,34.19,n,too far
+2026-04-21T18:58:22,0.5681,-0.0355,0.1961,0.903,0.2411,False,-1,none,31.49,n,too far

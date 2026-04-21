@@ -1,0 +1,2 @@
+timestamp,target_x,target_y,target_z,confidence,depth_m,fk_success,fk_contact_step,contact_method,duration_s,human_success,notes
+2026-04-21T18:47:04,0.5566,-0.1330,-0.0311,0.963,0.2296,False,-1,none,32.74,n,Too high and too close

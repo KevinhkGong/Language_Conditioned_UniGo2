@@ -312,6 +312,14 @@ class HeuristicContact:
         contact_proximity_m: float = CONTACT_PROXIMITY_M,
         use_foot_force:      bool  = False,
         audio_detector:      Optional[object] = None,
+        # NEW (calibration support): per-call offset overrides. If None,
+        # fall back to module-level FR_*_OFFSET_* constants. Used by
+        # scripts/calibrate_wall_standoff.py to tune offsets live between
+        # attempts without editing this file.
+        fr_lift_offset_wall:    Optional[np.ndarray] = None,
+        fr_extend_offset_wall:  Optional[np.ndarray] = None,
+        fr_lift_offset_ground:  Optional[np.ndarray] = None,
+        fr_press_offset_ground: Optional[np.ndarray] = None,
     ) -> ContactResult:
         """
         Execute the full contact sequence.
@@ -350,6 +358,31 @@ class HeuristicContact:
         self._last_target_q     = None
         # NEW (v2.1 spec): wire audio detector for this episode. None is fine.
         self._audio_detector    = audio_detector
+
+        # NEW (calibration support): resolve runtime offsets. If caller
+        # passes explicit overrides they win; otherwise use the module-level
+        # defaults. Stored on self so _control_loop can read them without
+        # further plumbing.
+        self._fr_lift_offset_wall_runtime = (
+            np.asarray(fr_lift_offset_wall, dtype=np.float64)
+            if fr_lift_offset_wall is not None
+            else FR_LIFT_OFFSET_WALL
+        )
+        self._fr_extend_offset_wall_runtime = (
+            np.asarray(fr_extend_offset_wall, dtype=np.float64)
+            if fr_extend_offset_wall is not None
+            else FR_EXTEND_OFFSET_WALL
+        )
+        self._fr_lift_offset_ground_runtime = (
+            np.asarray(fr_lift_offset_ground, dtype=np.float64)
+            if fr_lift_offset_ground is not None
+            else FR_LIFT_OFFSET_GROUND
+        )
+        self._fr_press_offset_ground_runtime = (
+            np.asarray(fr_press_offset_ground, dtype=np.float64)
+            if fr_press_offset_ground is not None
+            else FR_PRESS_OFFSET_GROUND
+        )
 
         if use_foot_force:
             logger.warning(
@@ -469,12 +502,15 @@ class HeuristicContact:
         target_q = list(STAND_POS)
 
         # ── Select offsets based on press_mode ───────────────────────
+        # Uses runtime overrides if execute() was called with explicit
+        # offset kwargs; otherwise falls back to module-level constants
+        # via the _runtime attributes set at execute() entry.
         if self._press_mode == "ground":
-            lift_offset   = FR_LIFT_OFFSET_GROUND
-            extend_offset = FR_PRESS_OFFSET_GROUND
+            lift_offset   = self._fr_lift_offset_ground_runtime
+            extend_offset = self._fr_press_offset_ground_runtime
         else:
-            lift_offset   = FR_LIFT_OFFSET_WALL
-            extend_offset = FR_EXTEND_OFFSET_WALL
+            lift_offset   = self._fr_lift_offset_wall_runtime
+            extend_offset = self._fr_extend_offset_wall_runtime
 
         # ── Gate helpers ──────────────────────────────────────────────
         def gate_passed(target_pos, indices, threshold=GATE_THRESHOLD):

@@ -40,6 +40,21 @@ PRESS_OFFSET_Y = 0.140   # m — left of FR foot at standing
 logger = logging.getLogger("measure_standoff")
 
 
+HEADER_LINE = (
+    f"{'time':>8}  {'conf':>5}  "
+    f"{'target_x':>9} {'target_y':>9} {'target_z':>9}  "
+    f"{'off_x':>7} {'off_y':>7}  depth(m)"
+)
+SEPARATOR = "-" * 80
+
+
+def _print_header() -> None:
+    print()
+    print(SEPARATOR)
+    print(HEADER_LINE)
+    print(SEPARATOR)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Live standoff-measurement tool.")
     ap.add_argument("--interface", type=str, default=DEFAULT_INTERFACE)
@@ -47,13 +62,27 @@ def main() -> int:
     ap.add_argument("--rate-hz", type=float, default=5.0)
     ap.add_argument("--min-conf", type=float, default=0.3,
                     help="Minimum grounding confidence to print a reading.")
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--header-every", type=int, default=10,
+                    help="Re-print the column header every N rows "
+                         "(0 to disable).")
+    ap.add_argument("--show-library-logs", action="store_true",
+                    help="Show internal GroundingDINO/SAM2 log messages "
+                         "(suppressed by default for cleaner output).")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Enable DEBUG logging on this script's logger.")
     args = ap.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Suppress noisy library loggers unless --show-library-logs is set.
+    # Default to quiet so the data table stays readable. These are the
+    # loggers SAM2 / GroundingDINO emit on each call.
+    if not args.show_library_logs:
+        for name in ("root", "sam2", "groundingdino"):
+            logging.getLogger(name).setLevel(logging.WARNING)
 
     logger.info(f"ChannelFactoryInitialize on {args.interface}…")
     ChannelFactoryInitialize(0, args.interface)
@@ -71,21 +100,21 @@ def main() -> int:
     print(f"Live standoff measurement — prompt: '{args.prompt}'")
     print("=" * 72)
     print()
-    print(f"Ideal standoff: x≈{PRESS_OFFSET_X:+.3f}  y≈{PRESS_OFFSET_Y:+.3f}")
-    print(f"(position robot so (standoff_x, standoff_y) ≈ (0, 0))")
-    print()
-    print(f"{'time':>8}  {'conf':>5}  "
-          f"{'target_x':>9} {'target_y':>9} {'target_z':>9}  "
-          f"{'off_x':>7} {'off_y':>7}  depth(m)")
-    print("-" * 80)
+    print(f"Ideal standoff: target_x≈{PRESS_OFFSET_X:+.3f}  "
+          f"target_y≈{PRESS_OFFSET_Y:+.3f}")
+    print(f"(position robot so (off_x, off_y) ≈ (0, 0))")
+    _print_header()
 
     t0 = time.monotonic()
+    row_count = 0
+
     try:
         while True:
             t1 = time.monotonic()
             frame = camera.get_frame()
             if frame is None:
                 print(f"{time.monotonic()-t0:>8.1f}  (no frame)")
+                row_count += 1
                 time.sleep(period)
                 continue
 
@@ -108,6 +137,11 @@ def main() -> int:
                     f"{pos[0]:>+9.3f} {pos[1]:>+9.3f} {pos[2]:>+9.3f}  "
                     f"{off_x:>+7.3f} {off_y:>+7.3f}  {depth:.3f}"
                 )
+            row_count += 1
+
+            # Reprint header every N rows so it stays on-screen in the terminal
+            if args.header_every > 0 and row_count % args.header_every == 0:
+                _print_header()
 
             elapsed = time.monotonic() - t1
             time.sleep(max(0.0, period - elapsed))

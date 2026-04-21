@@ -72,7 +72,7 @@ class Go2Interface:
         once SAM2 re-grounding is integrated (Phase 4).
     """
 
-    def __init__(self, network_interface: str = DEFAULT_NETWORK_INTERFACE):
+    def __init__(self, network_interface: str = DEFAULT_NETWORK_INTERFACE, already_initialized: bool = False,):
         """
         Initialise the Sport Mode client and connect to the Go2.
 
@@ -87,7 +87,8 @@ class Go2Interface:
 
         # Initialise the DDS channel factory — must be called once before
         # any client is created.
-        ChannelFactoryInitialize(0, network_interface)
+        if not already_initialized:
+            ChannelFactoryInitialize(0, network_interface)
 
         # Create and initialise the Sport Mode client
         self._client = SportClient()
