@@ -13,7 +13,7 @@ Execution sequence:
     3. weight_shift   — gate: FL/RL/RR hips at WEIGHT_SHIFT_POS
     4. lift           — gate: FR thigh near lift target
     5. extend/press   — gate: FR thigh near extend/press target
-    6. hold           — timeout or contact detected
+    6. hold           — timeout, FK-proximity contact, or AUDIO contact
     7. retract        — gate: FR thigh near WEIGHT_SHIFT_POS
     8. weight_unshift — gate: all joints near STAND_POS
     9. settle         — gate: all joints near STAND_POS (tighter)
@@ -46,6 +46,24 @@ Key fixes vs previous version:
     - Foot force contact detection added as a stub (disabled by default).
       FR foot force readings were found unreliable on this hardware during
       initial testing. Enable with use_foot_force=True once characterised.
+
+Additions for Stage C / Stage D data collection (v2.0 spec, April 21 2026):
+    - self._phase_transitions: dict capturing actual joint positions at each
+      gate-passed phase transition. Returned in ContactResult.
+    - self.current_waypoint_fr: np.ndarray (3,) updated every 500 Hz control
+      step with the current FR command. Exposed for external observer
+      threads (StageDRecorder) to log as the "nominal" waypoint.
+    - ContactResult now carries the phase_transitions dict.
+    These are ADDITIVE only — no change to control logic, gates, timing, or gains.
+
+Additions for audio-based contact verification (v2.1 spec, April 21 2026):
+    - Optional audio_detector parameter on execute(). When provided, audio
+      energy spikes during the hold phase count as contact (same role as
+      FK proximity). The authoritative "button was physically pressed" signal.
+    - Whichever of audio / FK-proximity / foot-force fires first sets
+      self._contact_step and the detection method is logged in
+      self._contact_method ("audio", "fk", "foot_force") for downstream
+      metadata. Default behavior (audio_detector=None) is unchanged.
 """
 
 import time
@@ -53,7 +71,7 @@ import logging
 import threading
 import concurrent.futures
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 
@@ -183,6 +201,15 @@ class ContactResult:
     joint_trajectory:   np.ndarray   # (T, 12) — hold phase, actual positions
     fr_foot_trajectory: np.ndarray   # (T, 3)  — hold phase, FK estimates
     duration_s:         float
+    phase_transitions:  dict         # (v2.0 spec): maps phase_name_end
+                                     # → 12-dim np.float32 actual joint vector
+                                     # captured at each gate-passed transition.
+                                     # Mandatory keys for Stage C training:
+                                     #   "lift_end", "extend_end", "hold_end"
+    contact_method:     str          # NEW (v2.1 spec): which signal fired first.
+                                     # One of: "fk", "audio", "foot_force", "none".
+                                     # "none" means hold timed out via
+                                     # CONTACT_MAX_STEPS without any contact.
 
 
 # ──────────────────────────────────────────────
@@ -208,6 +235,9 @@ class HeuristicContact:
         self._start_pos    = list(SIT_POS)
         self._done         = False
         self._contact_step = -1
+        # NEW (v2.1 spec): which signal fired first — "fk", "audio", "foot_force",
+        # or "none" if hold timed out without contact. Reset per episode.
+        self._contact_method = "none"
         self._joint_traj   = []
         self._fr_foot_traj = []
 
@@ -226,6 +256,29 @@ class HeuristicContact:
         self._unshift_start   = list(STAND_POS)
         self._settle_start    = list(STAND_POS)
         self._lower_start     = list(STAND_POS)
+
+        # ── (v2.0 spec) — external observer / data collection interface ──────
+        # Actual joint positions captured at each gate-passed phase transition.
+        # Populated inside _control_loop at the moment should_advance() returns
+        # True, before self._phase advances. Reset per episode in execute().
+        # Returned in ContactResult.phase_transitions.
+        self._phase_transitions: dict = {}
+
+        # Most recent commanded FR pose [hip, thigh, calf], updated every
+        # _control_loop call including during intra-phase interpolation.
+        # Exposed (not underscored) so external observer threads
+        # (e.g., StageDRecorder) can read it at 500 Hz as the "nominal"
+        # waypoint the heuristic is currently driving toward.
+        self.current_waypoint_fr = np.zeros(3, dtype=np.float32)
+        # ── end v2.0 additions ───────────────────────────────────────────────
+
+        # ── NEW (v2.1 spec) — optional audio-based contact detection ─────────
+        # Set by execute() when an audio detector is passed in. Interface:
+        #   - .sound_detected: bool, True once energy spike was detected
+        #                      (duck-typed; we only read this attribute)
+        # None means no audio detection this episode (behavior identical to v2.0).
+        self._audio_detector = None
+        # ── end v2.1 additions ───────────────────────────────────────────────
 
         if not already_initialized:
             ChannelFactoryInitialize(0, network_interface)
@@ -258,6 +311,7 @@ class HeuristicContact:
         press_mode:          Literal["wall", "ground"] = "ground",
         contact_proximity_m: float = CONTACT_PROXIMITY_M,
         use_foot_force:      bool  = False,
+        audio_detector:      Optional[object] = None,
     ) -> ContactResult:
         """
         Execute the full contact sequence.
@@ -272,16 +326,30 @@ class HeuristicContact:
                                  Currently disabled — FR foot force unreliable on this hardware.
                                  Enable only after calibrating FOOT_FORCE_CONTACT_THRESHOLD
                                  using print_pose.py (lifted baseline vs pressed contact).
+            audio_detector:      NEW (v2.1). Optional object with a `sound_detected: bool`
+                                 attribute. When provided, an audio energy spike during
+                                 the hold phase counts as contact alongside FK proximity
+                                 and foot force. The first signal to fire sets
+                                 self._contact_step and self._contact_method.
+                                 Caller is responsible for lifecycle: call
+                                 audio_detector.start_episode() before execute() and
+                                 reset/stop after. Pass None (default) for no audio.
         """
         self._joint_traj        = []
         self._fr_foot_traj      = []
+        # (v2.0 spec): reset phase transition snapshots for this episode.
+        self._phase_transitions = {}
         self._contact_step      = -1
+        # NEW (v2.1 spec): reset contact-method flag for this episode.
+        self._contact_method    = "none"
         self._done              = False
         self._press_mode        = press_mode
         self._target_offset     = target_offset_xyz
         self._contact_proximity = contact_proximity_m
         self._use_foot_force    = use_foot_force
         self._last_target_q     = None
+        # NEW (v2.1 spec): wire audio detector for this episode. None is fine.
+        self._audio_detector    = audio_detector
 
         if use_foot_force:
             logger.warning(
@@ -289,6 +357,9 @@ class HeuristicContact:
                 "FR foot force was unreliable during initial testing. "
                 "Calibrate FOOT_FORCE_CONTACT_THRESHOLD with print_pose.py first."
             )
+
+        if audio_detector is not None:
+            logger.info("Audio-based contact detection enabled.")
 
         logger.info(
             f"execute() — press_mode='{press_mode}'  target={target_offset_xyz}"
@@ -355,6 +426,10 @@ class HeuristicContact:
             fr_foot_trajectory=np.array(self._fr_foot_traj)
                 if self._fr_foot_traj else np.zeros((0, 3)),
             duration_s=duration,
+            # (v2.0 spec): return a copy so caller can safely mutate.
+            phase_transitions=self._phase_transitions.copy(),
+            # NEW (v2.1 spec): record which signal fired first.
+            contact_method=self._contact_method,
         )
 
     # ──────────────────────────────────────────────
@@ -429,6 +504,9 @@ class HeuristicContact:
             gate_ok = gate_passed(STAND_POS, range(12), threshold=0.2)
             if should_advance(STEPS_SIT_TO_STAND, gate_ok):
                 logger.info("✓ sit_to_stand complete")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["sit_to_stand_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase      = "weight_shift"
                 self._phase_step = 0
 
@@ -441,6 +519,9 @@ class HeuristicContact:
             gate_ok = gate_passed(WEIGHT_SHIFT_POS, [3, 9, 6], threshold=0.15)
             if should_advance(STEPS_WEIGHT_SHIFT, gate_ok):
                 logger.info("✓ weight_shift complete")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["weight_shift_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._weight_shift_end = list(actual)
                 self._phase      = "lift"
                 self._phase_step = 0
@@ -466,6 +547,9 @@ class HeuristicContact:
             gate_ok = abs(actual[FR_THIGH] - fr_l[1]) < GATE_THRESHOLD
             if should_advance(STEPS_LIFT, gate_ok):
                 logger.info(f"✓ lift complete  FR_thigh={actual[FR_THIGH]:+.3f}")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["lift_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase        = "extend"
                 self._phase_step   = 0
                 self._lift_end_pos = list(target_q)
@@ -491,6 +575,9 @@ class HeuristicContact:
             gate_ok = abs(actual[FR_THIGH] - fr_e[1]) < GATE_THRESHOLD
             if should_advance(STEPS_EXTEND, gate_ok):
                 logger.info(f"✓ extend complete  FR_thigh={actual[FR_THIGH]:+.3f}")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["extend_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase      = "hold"
                 self._phase_step = 0
                 self._hold_pos   = list(target_q)
@@ -502,6 +589,10 @@ class HeuristicContact:
             self._joint_traj.append(list(actual))
             fr_foot = self._estimate_fr_foot(actual)
             self._fr_foot_traj.append(fr_foot.tolist())
+
+            # ── Contact detection — three parallel signals ─────────────
+            # Whichever fires first wins and its method is recorded in
+            # self._contact_method for downstream metadata.
 
             # Primary: FK proximity contact detection
             dist       = np.linalg.norm(fr_foot - self._target_offset)
@@ -521,14 +612,38 @@ class HeuristicContact:
                         f"Foot force contact trigger: fr_force={fr_force:.1f}"
                     )
 
-            contact_detected = fk_contact or force_contact
+            # NEW (v2.1 spec): audio-based contact detection.
+            # The audio detector runs a background thread listening for an
+            # energy spike on the USB mic. When the button's sound module
+            # fires, sound_detected flips True. We treat this as the
+            # authoritative physical-contact signal — the button was
+            # physically depressed enough to trigger its sound module.
+            # Read is atomic (bool); no lock needed.
+            audio_contact = False
+            if self._audio_detector is not None:
+                audio_contact = bool(
+                    getattr(self._audio_detector, "sound_detected", False)
+                )
+
+            contact_detected = fk_contact or force_contact or audio_contact
 
             if contact_detected and self._contact_step < 0:
                 self._contact_step = self._phase_step
-                method = "FK-proximity" if fk_contact else "foot-force"
+                # Record which signal fired first. Priority order reflects
+                # reliability: audio is physical proof, FK is geometric
+                # estimate, foot force is currently unreliable.
+                # Multiple signals may fire on the same step; we pick the
+                # most authoritative.
+                if audio_contact:
+                    self._contact_method = "audio"
+                elif fk_contact:
+                    self._contact_method = "fk"
+                elif force_contact:
+                    self._contact_method = "foot_force"
                 logger.info(
                     f"Contact detected at step {self._contact_step} "
-                    f"dist={dist:.3f}m  fr_force={fr_force:.1f}  method={method}"
+                    f"dist={dist:.3f}m  fr_force={fr_force:.1f}  "
+                    f"audio={audio_contact}  method={self._contact_method}"
                 )
 
             contact_done = (
@@ -537,6 +652,11 @@ class HeuristicContact:
             )
             if contact_done or self._phase_step >= CONTACT_MAX_STEPS:
                 logger.info("✓ hold complete — retracting")
+                # (v2.0 spec): capture actual at gate-passed transition.
+                # This is the "press_waypoint" label for Stage C training — the
+                # actual FR joint pose at the end of hold, just before retract.
+                self._phase_transitions["hold_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase         = "retract_curl"
                 self._phase_step    = 0
                 # FIX: capture actual positions, not commanded target_q.
@@ -559,6 +679,9 @@ class HeuristicContact:
             gate_ok = abs(actual[FR_CALF] - curl_calf_target) < GATE_THRESHOLD
             if should_advance(STEPS_RETRACT_CURL, gate_ok):
                 logger.info(f"✓ retract_curl complete  FR_calf={actual[FR_CALF]:+.3f}")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["retract_curl_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase           = "retract_rotate"
                 self._phase_step      = 0
                 self._retract_curl_end = list(actual)
@@ -576,6 +699,9 @@ class HeuristicContact:
             gate_ok = abs(actual[FR_THIGH] - WEIGHT_SHIFT_POS[FR_THIGH]) < GATE_THRESHOLD
             if should_advance(STEPS_RETRACT_ROTATE, gate_ok):
                 logger.info(f"✓ retract_rotate complete  FR_thigh={actual[FR_THIGH]:+.3f}")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["retract_rotate_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase             = "retract_extend"
                 self._phase_step        = 0
                 self._retract_rotate_end = list(actual)
@@ -592,6 +718,9 @@ class HeuristicContact:
             gate_ok = abs(actual[FR_CALF] - WEIGHT_SHIFT_POS[FR_CALF]) < GATE_THRESHOLD
             if should_advance(STEPS_RETRACT_EXTEND, gate_ok):
                 logger.info(f"✓ retract_extend complete  FR_calf={actual[FR_CALF]:+.3f}")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["retract_extend_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase         = "weight_unshift"
                 self._phase_step    = 0
                 self._unshift_start = list(actual)
@@ -608,6 +737,9 @@ class HeuristicContact:
             gate_ok = gate_passed(STAND_POS, range(12), threshold=0.15)
             if should_advance(STEPS_WEIGHT_SHIFT_BACK, gate_ok):
                 logger.info("✓ weight_unshift complete")
+                # Note (v2.0 spec): no snapshot for weight_unshift → settle per
+                # spec Section 7.1 — only 9 snapshots requested, and this one
+                # is not among them.
                 self._phase        = "settle"
                 self._phase_step   = 0
                 self._settle_start = list(actual)
@@ -626,6 +758,9 @@ class HeuristicContact:
             gate_ok = gate_passed(STAND_POS, range(12), threshold=0.15)
             if should_advance(STEPS_SETTLE, gate_ok):
                 logger.info("✓ settle complete — starting lower_to_sit")
+                # (v2.0 spec): capture actual at gate-passed transition
+                self._phase_transitions["settle_end"] = \
+                    np.array(actual, dtype=np.float32)
                 self._phase       = "lower_to_sit"
                 self._phase_step  = 0
                 self._lower_start = list(STAND_POS)
@@ -640,12 +775,18 @@ class HeuristicContact:
             gate_ok = gate_passed(SIT_POS, range(12), threshold=0.2)
             if should_advance(STEPS_LOWER_TO_SIT, gate_ok):
                 logger.info("✓ lower_to_sit complete")
+                # Note (v2.0 spec): no snapshot for lower_to_sit → done per spec.
                 self._phase = "done"
 
         # ── done ──────────────────────────────────────────────────────
         elif self._phase == "done":
             target_q   = list(SIT_POS)
             self._done = True
+            # (v2.0 spec): keep current_waypoint_fr in sync on early-return
+            # path for consistency with the main path below. Not strictly needed
+            # (recorder only samples during lift/extend/hold) but avoids stale
+            # values if a caller inspects this attribute after execute() returns.
+            self.current_waypoint_fr = np.array(target_q[0:3], dtype=np.float32)
             self._send_cmd(target_q)
             return
 
@@ -673,6 +814,12 @@ class HeuristicContact:
             target_q[4]  = np.clip(target_q[4],   0.3,  1.5)
             target_q[7]  = np.clip(target_q[7],   0.3,  1.5)
             target_q[10] = np.clip(target_q[10],  0.3,  1.5)
+
+        # (v2.0 spec): expose current FR command for external observer
+        # threads (e.g., StageDRecorder) to log at 500 Hz as the "nominal"
+        # waypoint. Updated every control step including during intra-phase
+        # interpolation — not only at phase transitions.
+        self.current_waypoint_fr = np.array(target_q[0:3], dtype=np.float32)
 
         # Cache last command and send
         self._last_target_q = target_q
@@ -841,6 +988,7 @@ if __name__ == "__main__":
     print(f"Mode:       {args.mode}")
     print(f"Target:     ({args.target_x}, {args.target_y}, {args.target_z})")
     print(f"Foot force: {'enabled (stub)' if args.foot_force else 'disabled'}")
+    print(f"Audio:      disabled (CLI does not wire a detector; pass via script)")
     print("\nPhases: sit_to_stand → weight_shift → lift → extend → "
           "hold → retract → weight_unshift → settle → lower_to_sit → done")
     print("Each phase waits for gate confirmation before advancing.")
@@ -862,15 +1010,24 @@ if __name__ == "__main__":
         print("Dry-run — skipping execution.")
     else:
         target = np.array([args.target_x, args.target_y, args.target_z])
+        # CLI invocation leaves audio_detector=None (default).
+        # Data collection scripts pass a real AudioLiveDetector instance.
         result = controller.execute(
             target_offset_xyz=target,
             press_mode=args.mode,
             use_foot_force=args.foot_force,
         )
         print(f"\nResult:")
-        print(f"  success:      {result.success}")
-        print(f"  contact_step: {result.contact_step}")
-        print(f"  timeout:      {result.timeout}")
-        print(f"  press_mode:   {result.press_mode}")
-        print(f"  duration:     {result.duration_s:.2f}s")
-        print(f"  traj_shape:   {result.joint_trajectory.shape}")
+        print(f"  success:           {result.success}")
+        print(f"  contact_step:      {result.contact_step}")
+        print(f"  contact_method:    {result.contact_method}")   # NEW (v2.1)
+        print(f"  timeout:           {result.timeout}")
+        print(f"  press_mode:        {result.press_mode}")
+        print(f"  duration:          {result.duration_s:.2f}s")
+        print(f"  traj_shape:        {result.joint_trajectory.shape}")
+        # (v2.0 spec): print captured phase transitions for quick inspection
+        print(f"  phase_transitions: {list(result.phase_transitions.keys())}")
+        if "hold_end" in result.phase_transitions:
+            fr_press = result.phase_transitions["hold_end"][0:3]
+            print(f"    FR @ hold_end: hip={fr_press[0]:+.3f} "
+                  f"thigh={fr_press[1]:+.3f} calf={fr_press[2]:+.3f}")
