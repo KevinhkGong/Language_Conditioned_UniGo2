@@ -24,7 +24,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-VALID_COLORS = ("red", "blue", "green", "yellow")
+VALID_COLORS = ("red", "blue", "green", "yellow", "orange")
 
 PASS = "\033[92m[PASS]\033[0m"
 FAIL = "\033[91m[FAIL]\033[0m"

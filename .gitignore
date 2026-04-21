@@ -17,6 +17,8 @@ data/real/*
 # Environment
 .env
 *.env
+.venv_smoke
+.venv311
 
 # IDE
 .vscode/

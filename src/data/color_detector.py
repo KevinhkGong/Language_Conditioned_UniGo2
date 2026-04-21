@@ -5,13 +5,14 @@ Post-hoc color word identification from audio waveform via faster-whisper.
 """
 
 import logging
+import re
 from typing import Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-VALID_COLORS = ["red", "blue", "green", "yellow"]
+VALID_COLORS = ["red", "blue", "green", "yellow", "orange"]
 
 
 class ColorDetector:
@@ -65,10 +66,12 @@ class ColorDetector:
             audio, language="en", beam_size=1,
         )
         transcript = " ".join(s.text for s in segments).lower().strip()
+        normalized = re.sub(r"[^a-z]+", " ", transcript).strip()
+        tokens = normalized.split()
 
         detected = None
         for color in VALID_COLORS:
-            if color in transcript:
+            if color in tokens or color in transcript:
                 detected = color
                 break
 
