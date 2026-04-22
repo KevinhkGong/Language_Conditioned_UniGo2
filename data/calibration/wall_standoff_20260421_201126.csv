@@ -1,0 +1,4 @@
+timestamp,target_x,target_y,target_z,confidence,depth_m,lift_hip,lift_thigh,lift_calf,extend_hip,extend_thigh,extend_calf,fk_success,fk_contact_step,contact_method,duration_s,human_success,notes
+2026-04-21T20:12:30,0.6104,-0.0425,0.2484,0.9271,0.2834,0.0400,-1.0000,0.1000,0.0400,-2.0000,0.5200,False,-1,none,32.6401,n,n
+2026-04-21T20:14:16,0.6103,-0.0354,0.2307,0.9463,0.2833,0.0400,-1.0000,0.1000,0.0400,-2.0000,0.5200,False,-1,none,33.3658,n,n
+2026-04-21T20:16:04,0.6030,-0.0231,0.2384,0.9044,0.2760,0.0400,-1.0000,0.1000,0.0400,-2.0000,0.5200,False,-1,none,33.2835,n,too close

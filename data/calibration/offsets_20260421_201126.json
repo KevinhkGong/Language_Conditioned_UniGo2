@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-04-21T20:17:49",
+  "note": "final after 3 attempts",
+  "fr_lift_offset_wall": [
+    0.04,
+    -1.0,
+    0.1
+  ],
+  "fr_extend_offset_wall": [
+    0.04,
+    -2.0,
+    0.52
+  ]
+}
