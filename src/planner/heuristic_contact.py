@@ -71,7 +71,7 @@ import logging
 import threading
 import concurrent.futures
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import numpy as np
 
@@ -103,6 +103,17 @@ KP_FR     = 40.0
 KD_FR     = 3.0
 KP_SOFT   = 25.0
 KD_SOFT   = 3.0
+
+# Compliance gains for hand-guided demonstration (Stage D v2).
+# When a subclass flips self._compliance_active = True, the FR leg drops to
+# these gains during the extend and hold phases ONLY so the operator can
+# physically guide the paw onto the button. All other legs, and the FR leg
+# in every other phase (including lift and the retract sequence), keep their
+# normal gains — softening the mid-air extended leg during retract would
+# trigger the same kind of torque discontinuity that the v2.0 retract-curl
+# fix was introduced to eliminate.
+KP_FR_COMPLIANT = 15.0
+KD_FR_COMPLIANT = 1.5
 
 # Phase durations (steps at 500 Hz) — used as minimum; gate check is real trigger
 STEPS_SIT_TO_STAND      = 1000   # 2.0s min
@@ -164,8 +175,8 @@ WEIGHT_SHIFT_POS[10] = STAND_POS[10] - 0.10   # RL_thigh lower
 # ── FR leg offsets — wall press ───────────────────────────────────────────────
 # Leg swings forward and out to reach a wall-mounted button.
 # Thigh goes strongly negative (paw-forward), calf stays near neutral.
-FR_LIFT_OFFSET_WALL   = np.array([+0.04, -1.0,  0.0])
-FR_EXTEND_OFFSET_WALL = np.array([+0.04, -2.0, -0.1])
+FR_LIFT_OFFSET_WALL   = np.array([+0.04, -2.0, +0.10])
+FR_EXTEND_OFFSET_WALL = np.array([+0.04, -2.0, +0.52])
 
 # ── FR leg offsets — ground press ─────────────────────────────────────────────
 # Button is ~3 inches (7.6 cm) in front of FR foot at standing, ~1.5 inches tall.
@@ -280,6 +291,12 @@ class HeuristicContact:
         self._audio_detector = None
         # ── end v2.1 additions ───────────────────────────────────────────────
 
+        # ── NEW (Stage D v2) — compliance mode for hand-guided collection ────
+        # Base class default: False (rigid FR tracking, identical to v2.1).
+        # HeuristicContactGuided flips this to True so _send_cmd drops the FR
+        # leg to KP_FR_COMPLIANT/KD_FR_COMPLIANT during extend + hold.
+        self._compliance_active: bool = False
+
         if not already_initialized:
             ChannelFactoryInitialize(0, network_interface)
 
@@ -312,6 +329,7 @@ class HeuristicContact:
         contact_proximity_m: float = CONTACT_PROXIMITY_M,
         use_foot_force:      bool  = False,
         audio_detector:      Optional[object] = None,
+        target_refresh_fn:   Optional[Callable[[], Optional[np.ndarray]]] = None,  # NEW
         # NEW (calibration support): per-call offset overrides. If None,
         # fall back to module-level FR_*_OFFSET_* constants. Used by
         # scripts/calibrate_wall_standoff.py to tune offsets live between
@@ -358,6 +376,7 @@ class HeuristicContact:
         self._last_target_q     = None
         # NEW (v2.1 spec): wire audio detector for this episode. None is fine.
         self._audio_detector    = audio_detector
+        self._target_refresh_fn = target_refresh_fn
 
         # NEW (calibration support): resolve runtime offsets. If caller
         # passes explicit overrides they win; otherwise use the module-level
@@ -543,6 +562,25 @@ class HeuristicContact:
                 # (v2.0 spec): capture actual at gate-passed transition
                 self._phase_transitions["sit_to_stand_end"] = \
                     np.array(actual, dtype=np.float32)
+                # Refresh target post-stand — base may have drifted during sit_to_stand
+                if self._target_refresh_fn is not None:
+                    try:
+                        fresh = self._target_refresh_fn()
+                    except Exception as e:
+                        logger.warning(f"Target refresh failed: {e}")
+                        fresh = None
+                    if fresh is not None:
+                        old_target = self._target_offset.copy()
+                        fresh_xy_only = np.asarray(fresh, dtype=np.float64).copy()
+                        fresh_xy_only[2] = old_target[2]  # preserve original z
+                        self._target_offset = fresh_xy_only
+                        delta = np.linalg.norm(self._target_offset[:2] - old_target[:2])
+                        logger.info(
+                            f"Target refreshed (xy only) post-sit_to_stand: "
+                            f"old=[{old_target[0]:+.3f}, {old_target[1]:+.3f}, {old_target[2]:+.3f}]  "
+                            f"new=[{self._target_offset[0]:+.3f}, {self._target_offset[1]:+.3f}, {self._target_offset[2]:+.3f}]  "
+                            f"shift_xy={delta*100:.1f}cm"
+                        )
                 self._phase      = "weight_shift"
                 self._phase_step = 0
 
@@ -874,8 +912,19 @@ class HeuristicContact:
                 # mid-air extended FR leg that destabilized the support legs.
                 "retract_curl", "retract_rotate", "retract_extend"
             ):
-                self._low_cmd.motor_cmd[i].kp = KP_FR
-                self._low_cmd.motor_cmd[i].kd = KD_FR
+                # Stage D v2: compliance mode softens the FR leg during
+                # extend + hold so the operator can physically guide the paw
+                # onto the button. lift stays at KP_FR so the leg gets to the
+                # approach pose reliably, and retract stays at KP_FR so the
+                # gain-restore transition out of hold → retract_curl starts
+                # from _retract_start = list(actual) — the same mechanism that
+                # eliminated the v2.0 retract torque spike.
+                if self._compliance_active and self._phase in ("extend", "hold"):
+                    self._low_cmd.motor_cmd[i].kp = KP_FR_COMPLIANT
+                    self._low_cmd.motor_cmd[i].kd = KD_FR_COMPLIANT
+                else:
+                    self._low_cmd.motor_cmd[i].kp = KP_FR
+                    self._low_cmd.motor_cmd[i].kd = KD_FR
             elif self._phase == "lower_to_sit":
                 self._low_cmd.motor_cmd[i].kp = KP_SOFT
                 self._low_cmd.motor_cmd[i].kd = KD_SOFT

@@ -32,13 +32,18 @@ class AudioLiveDetector:
                  threshold_db: float = 20.0,
                  min_duration_ms: int = 50,
                  baseline_duration_s: float = 2.0,
-                 block_duration_ms: int = 20):
+                 block_duration_ms: int = 20,
+                 capture_sample_rate: Optional[int] = None):
         self.sample_rate = sample_rate
         self.device_index = device_index
         self.threshold_db = threshold_db
         self.min_duration_ms = min_duration_ms
         self.baseline_duration_s = baseline_duration_s
-        self.block_size = int(sample_rate * block_duration_ms / 1000)
+        # Use capture_sample_rate for block sizing when PipeWire forces a higher rate.
+        # RMS detection is energy-based so resampling is not needed here.
+        _capture_rate = capture_sample_rate if capture_sample_rate else sample_rate
+        self._capture_rate = _capture_rate
+        self.block_size = int(_capture_rate * block_duration_ms / 1000)
         self.block_duration_ms = block_duration_ms
 
         # Public state
@@ -55,7 +60,7 @@ class AudioLiveDetector:
 
     def start_stream(self):
         self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
+            samplerate=self._capture_rate,
             channels=1,
             dtype='float32',
             blocksize=self.block_size,
@@ -63,7 +68,7 @@ class AudioLiveDetector:
             callback=self._callback,
         )
         self._stream.start()
-        logger.info("AudioLiveDetector stream opened")
+        logger.info(f"AudioLiveDetector stream opened ({self._capture_rate} Hz, device={self.device_index})")
 
     def stop_stream(self):
         if self._stream is not None:

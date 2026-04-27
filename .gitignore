@@ -13,6 +13,7 @@ data/real/*
 *.pt
 *.pth
 *.ckpt
+models/
 
 # Environment
 .env
@@ -35,3 +36,14 @@ wandb/
 
 # Summaries
 Implementation_summaries/
+
+  # Debug captures (regrounding screenshots, intermediate frames)                            
+  data/debug/                                               
+
+  # Bare 'log' file/dir (extension-less)
+  /log
+  /log/
+
+  # Defense-in-depth — model & array formats outside known dirs
+  *.h5
+  *.npz

@@ -33,10 +33,16 @@ class AudioRecorder:
 
     def __init__(self, sample_rate: int = 16000,
                  device_index: Optional[int] = None,
-                 block_duration_ms: int = 50):
+                 block_duration_ms: int = 50,
+                 capture_sample_rate: Optional[int] = None,
+                 aux_callback=None):
         self.sample_rate = sample_rate
         self.device_index = device_index
-        self.block_size = int(sample_rate * block_duration_ms / 1000)
+        # capture_sample_rate lets us open the stream at a different rate
+        # (e.g. 48000 Hz when PipeWire blocks 16000 Hz) and resample on output.
+        self._capture_rate = capture_sample_rate if capture_sample_rate else sample_rate
+        self.block_size = int(self._capture_rate * block_duration_ms / 1000)
+        self._aux_callback = aux_callback
 
         self._stream: Optional[sd.InputStream] = None
         self._buffer_lock = threading.Lock()
@@ -46,7 +52,7 @@ class AudioRecorder:
 
     def start_stream(self):
         self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
+            samplerate=self._capture_rate,
             channels=1,
             dtype='float32',
             blocksize=self.block_size,
@@ -55,7 +61,8 @@ class AudioRecorder:
         )
         self._stream.start()
         logger.info(f"AudioRecorder stream opened "
-                    f"({self.sample_rate} Hz, device={self.device_index})")
+                    f"({self._capture_rate} Hz capture → {self.sample_rate} Hz output, "
+                    f"device={self.device_index})")
 
     def stop_stream(self):
         if self._stream is not None:
@@ -75,11 +82,18 @@ class AudioRecorder:
             self._recording = False
             if not self._buffer:
                 return np.zeros(0, dtype=np.float32)
-            return np.concatenate(self._buffer).astype(np.float32)
+            audio = np.concatenate(self._buffer).astype(np.float32)
+        if self._capture_rate != self.sample_rate:
+            from scipy import signal as _sig
+            n_out = int(len(audio) * self.sample_rate / self._capture_rate)
+            audio = _sig.resample(audio, n_out).astype(np.float32)
+        return audio
 
     def _callback(self, indata, frames, time_info, status):
         if status:
             logger.warning(f"sounddevice status: {status}")
+        if self._aux_callback is not None:
+            self._aux_callback(indata, frames, time_info, status)
         if not self._recording:
             return
         with self._buffer_lock:

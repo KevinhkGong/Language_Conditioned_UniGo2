@@ -1,0 +1,6 @@
+Session 20260424:
+  PRESS_OFFSET_X = 0.593
+  PRESS_OFFSET_Y = -0.047  
+  NAV_EXTRA_FORWARD_M = 0.1
+  Y_SIT_STAND_DRIFT_COMP = 0.0
+  Successful episodes without new metadata: 1 (20260424_132151)

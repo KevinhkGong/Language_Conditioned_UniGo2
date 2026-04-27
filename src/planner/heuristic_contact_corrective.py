@@ -76,26 +76,53 @@ class HeuristicContactCorrective(HeuristicContact):
     def _control_loop(self):
         """
         Override the base control loop. Runs the parent logic to compute the
-        nominal heuristic command, then overlays the Jacobian-PID correction
-        on the FR leg in correctable phases before sending.
+        nominal heuristic command, captures it (without publishing), then
+        overlays Jacobian-PID correction on the FR leg in correctable phases,
+        and publishes exactly ONE command per 500Hz cycle.
 
-        Approach: let parent compute and send the nominal command. If the
-        current phase is correctable, compute and send a corrected command
-        immediately after. At 500 Hz the second send supersedes the first
-        at the motor level. Overhead < 0.1 ms, well within 2 ms budget.
+        Previous implementation let the parent publish and then published a
+        second corrected command per cycle, doubling the DDS rate to 1000Hz
+        which caused motor oscillation on Go2X firmware. This version sends
+        exactly one command per cycle.
         """
-        super()._control_loop()
+        # Capture the parent's command without publishing it.
+        captured: list = []
 
-        if self._phase not in self.CORRECTABLE_PHASES:
-            self.last_delta_fr = np.zeros(3, dtype=np.float32)
+        real_send_cmd = self._send_cmd
+
+        def capture_send_cmd(target_q):
+            captured.append(list(target_q))
+
+        # Let parent run its full logic (gates, waypoints, IMU correction,
+        # phase transitions, etc) but redirect its publishes into `captured`.
+        self._send_cmd = capture_send_cmd  # type: ignore[assignment]
+        try:
+            super()._control_loop()
+        finally:
+            self._send_cmd = real_send_cmd  # type: ignore[assignment]
+
+        # If parent didn't publish this cycle (e.g. low_state was None and
+        # parent returned early via the stale-state branch), nothing to do.
+        if not captured:
             return
 
-        if self._low_state is None or self._last_target_q is None:
+        nominal = captured[-1]  # most recent parent publish intent
+
+        # If not in a correctable phase, publish the parent's nominal as-is.
+        if self._phase not in self.CORRECTABLE_PHASES:
+            self.last_delta_fr = np.zeros(3, dtype=np.float32)
+            real_send_cmd(nominal)
+            return
+
+        # Parent may have returned early for other reasons
+        if self._low_state is None:
+            real_send_cmd(nominal)
             return
 
         target = self.grounding_getter() if self.grounding_getter else None
         if target is None:
             self.last_delta_fr = np.zeros(3, dtype=np.float32)
+            real_send_cmd(nominal)
             return
 
         with self._state_lock:
@@ -109,12 +136,14 @@ class HeuristicContactCorrective(HeuristicContact):
         try:
             delta = np.linalg.pinv(J) @ (self.k_p * error)
         except np.linalg.LinAlgError:
-            logger.warning("Jacobian pseudoinverse failed; skipping correction")
+            logger.warning("Jacobian pseudoinverse failed; sending nominal only")
+            real_send_cmd(nominal)
             return
 
         delta = np.clip(delta, -MAX_DELTA_PER_STEP, MAX_DELTA_PER_STEP)
 
-        corrected = list(self._last_target_q)
+        # Apply correction to the nominal FR joints only, clipping to limits.
+        corrected = list(nominal)
         corrected[FR_HIP]   = float(np.clip(
             corrected[FR_HIP]   + delta[0], FR_HIP_MIN,   FR_HIP_MAX))
         corrected[FR_THIGH] = float(np.clip(
@@ -122,8 +151,13 @@ class HeuristicContactCorrective(HeuristicContact):
         corrected[FR_CALF]  = float(np.clip(
             corrected[FR_CALF]  + delta[2], FR_CALF_MIN,  FR_CALF_MAX))
 
+        # Publish the corrected command ONCE, via the real _send_cmd.
+        real_send_cmd(corrected)
+
+        # Keep the parent's internal bookkeeping in sync: _last_target_q is
+        # used by the parent's stale-state branch to resend on missed cycles,
+        # so it should reflect what we actually sent.
         self._last_target_q = corrected
-        self._send_cmd(corrected)
 
         self.last_delta_fr = delta.astype(np.float32)
 

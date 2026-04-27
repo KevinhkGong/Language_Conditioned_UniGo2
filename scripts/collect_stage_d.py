@@ -91,14 +91,24 @@ logger = logging.getLogger("collect_stage_d")
 # ──────────────────────────────────────────────
 
 PROMPT              = "red button"
-PRESS_OFFSET_X      = 0.203         # m — forward of FR foot at standing
-PRESS_OFFSET_Y      = 0.140         # m — left of FR foot at standing
+PRESS_OFFSET_X      = 0.593         # m — forward of FR foot at standing
+PRESS_OFFSET_Y      = -0.047         # m — left of FR foot at standing
+NAV_EXTRA_FORWARD_M = 0.20        # m — empirical forward bias added to standoff nav
 MIN_GROUNDING_CONF  = 0.5
-AUDIO_SAMPLE_RATE   = 16000         # Hz
+AUDIO_SAMPLE_RATE   = 16000         # Hz — logical rate for Whisper / HDF5
+# PipeWire holds exclusive hw access in env_go2; capture via PipeWire default
+# at its native quantum rate, then resample to AUDIO_SAMPLE_RATE in software.
+AUDIO_CAPTURE_RATE  = 48000         # Hz — actual stream rate opened against PipeWire
 AUDIO_BASELINE_S    = 2.0           # s of silence for AudioLiveDetector calibration
 SETTLE_AFTER_NAV_S  = 2.0           # s to wait after go2.stop() before re-ground
 GROUNDING_RATE_HZ   = 5.0
 COLOR_EXPECTED      = "red"         # single-button v1
+
+# Constant drift measured empirically — robot base shifts ~10 cm LEFT
+# during the StandDown() + sit_to_stand cycle inside heuristic.execute().
+# This is the leftward drift magnitude; compensation is applied by
+# commanding the robot to stand slightly rightward of the grounded standoff.
+Y_SIT_STAND_DRIFT_COMP = 0.0  # m; tune based on observed standoff target_y
 
 OUTPUT_ROOT = Path("data/real/stage_d")
 TUNING_SUBDIR = "tuning"
@@ -339,30 +349,35 @@ def _build_runtime(args) -> Runtime:
         record_correction=True,
     )
 
-    logger.info(f"Constructing AudioRecorder (mic_index={args.mic_index})…")
-    audio_recorder = AudioRecorder(
-        sample_rate=AUDIO_SAMPLE_RATE,
-        device_index=args.mic_index,
-    )
-
-    logger.info(f"Constructing AudioLiveDetector (mic_index={args.mic_index})…")
+    logger.info(f"Constructing AudioLiveDetector (device={args.mic_index}, {AUDIO_CAPTURE_RATE}→{AUDIO_SAMPLE_RATE} Hz)…")
     audio_detector = AudioLiveDetector(
         sample_rate=AUDIO_SAMPLE_RATE,
         device_index=args.mic_index,
         threshold_db=args.audio_threshold_db,
         min_duration_ms=50,
         baseline_duration_s=AUDIO_BASELINE_S,
+        capture_sample_rate=AUDIO_CAPTURE_RATE,
     )
 
-    logger.info("Constructing ColorDetector (Whisper tiny)…")
-    color_detector = ColorDetector(model_size="tiny", device="cuda", compute_type="float16")
+    logger.info(f"Constructing AudioRecorder (device={args.mic_index}, {AUDIO_CAPTURE_RATE}→{AUDIO_SAMPLE_RATE} Hz)…")
+    audio_recorder = AudioRecorder(
+        sample_rate=AUDIO_SAMPLE_RATE,
+        device_index=args.mic_index,
+        capture_sample_rate=AUDIO_CAPTURE_RATE,
+        aux_callback=audio_detector._callback,
+    )
 
+    logger.info("Constructing ColorDetector (Whisper small)…")
+    color_detector = ColorDetector(
+        model_size="small", device="cuda", compute_type="float16",
+        model_path=os.path.expanduser("~/Robotics/weights/faster-whisper-small"),
+    )
     logger.info("Pre-loading Whisper model…")
     color_detector.load()
 
     logger.info("Opening audio streams…")
     audio_recorder.start_stream()
-    audio_detector.start_stream()
+    # AudioLiveDetector shares the recorder's stream via aux_callback — no separate stream needed.
 
     logger.info("Calibrating AudioLiveDetector baseline (keep quiet)…")
     audio_detector.calibrate_baseline(AUDIO_BASELINE_S)
@@ -467,11 +482,13 @@ def run_one_episode(
         standoff_dx = (
             float(target_pos_base_initial[0])
             - PRESS_OFFSET_X
+            + NAV_EXTRA_FORWARD_M
             + float(cfg.perturbation_cmd[0])
         )
         standoff_dy = (
             float(target_pos_base_initial[1])
             - PRESS_OFFSET_Y
+            - Y_SIT_STAND_DRIFT_COMP   # compensate for leftward drift during sit/stand
             + float(cfg.perturbation_cmd[1])
         )
         logger.info(
@@ -479,6 +496,8 @@ def run_one_episode(
         )
         go2.move_to_position(standoff_dx, standoff_dy, 0.0, speed=0.3)
         go2.stop()
+        logger.info("balance_stand() — settling into symmetric stance…")
+        go2.balance_stand()
     else:
         # In tune-kp Episode B, apply perturbation only (user positioned for A)
         if float(np.linalg.norm(cfg.perturbation_cmd)) > 1e-4:
@@ -490,6 +509,8 @@ def run_one_episode(
             )
             go2.move_to_position(dx, dy, 0.0, speed=0.3)
             go2.stop()
+            logger.info("balance_stand() — settling into symmetric stance…")
+            go2.balance_stand()
 
     # ── Step 6: settle before re-grounding ──────────────────────────────────
     time.sleep(SETTLE_AFTER_NAV_S)
@@ -555,6 +576,7 @@ def run_one_episode(
             contact_proximity_m=CONTACT_PROXIMITY_M,
             use_foot_force=False,
             audio_detector=audio_detector,
+            target_refresh_fn=None,   # DIAGNOSTIC: disable refresh
         )
     except Exception as e:
         logger.exception(f"heuristic.execute raised: {e}")
@@ -591,7 +613,10 @@ def run_one_episode(
         "contact_method":          str(result.contact_method),
         "color_detected":          color_result.get("color_detected") or "",
         "color_expected":          COLOR_EXPECTED,
-        "success_target":          (color_result.get("color_detected") == COLOR_EXPECTED),
+        "success_target":          (
+            bool(getattr(audio_detector, "sound_detected", False))
+            and color_result.get("color_detected") == COLOR_EXPECTED
+        ),
         "audio_transcript":        color_result.get("transcript", ""),
     }
 
