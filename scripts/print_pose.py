@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowState_
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_, LowState_
 
 # ANSI colors
 RESET = "\033[0m"
@@ -96,6 +96,9 @@ def format_bar(value, min_v=-0.5, max_v=+0.5, width=40):
 class PoseDisplay:
     def __init__(self, log_path=None):
         self.low_state = None
+        self.low_cmd = None  # latest LowCmd_ from rt/lowcmd (Sport Mode or our own publisher)
+        self.low_cmd_age_s = None
+        self._low_cmd_t = None
         self.history = deque(maxlen=20)  # last 20 samples for smoothing
         self.start_time = time.monotonic()
         self.log_path = log_path
@@ -115,12 +118,21 @@ class PoseDisplay:
                     'acc_x', 'acc_y', 'acc_z',
                     'temp',
                     *JOINT_NAMES,
+                    *[f"{n}_kp" for n in JOINT_NAMES],
+                    *[f"{n}_kd" for n in JOINT_NAMES],
+                    *[f"{n}_q_cmd" for n in JOINT_NAMES],
+                    *[f"{n}_tau_ff" for n in JOINT_NAMES],
+                    *[f"{n}_tau_est" for n in JOINT_NAMES],
                     'foot_force_FR', 'foot_force_FL',
                     'foot_force_RR', 'foot_force_RL',
                 ])
 
     def lowstate_callback(self, msg):
         self.low_state = msg
+
+    def lowcmd_callback(self, msg):
+        self.low_cmd = msg
+        self._low_cmd_t = time.monotonic()
 
     def close(self):
         if self.log_file:
@@ -222,6 +234,62 @@ class PoseDisplay:
             print(f"  {leg:3s}: hip={hip:+.3f}  thigh={thigh:+.3f}  calf={calf:+.3f}")
         print()
 
+        # ─── Joint Gains (kp / kd) ────────────────────────────────────
+        # Sourced from rt/lowcmd. Sport Mode (preprogrammed motions like
+        # the handshake action) publishes its own low-level commands; our
+        # own low-level controller also publishes here. If no message has
+        # arrived yet, this section says so rather than printing zeros.
+        print(f"{BOLD}── Joint Gains kp / kd (from rt/lowcmd) ────────────────────────{RESET}")
+        if self.low_cmd is None:
+            print(f"  {YELLOW}(no LowCmd_ received yet — robot may be idle in high-level "
+                  f"or Sport Mode is not publishing){RESET}")
+        else:
+            age = (time.monotonic() - self._low_cmd_t) if self._low_cmd_t else None
+            age_color = GREEN if (age is not None and age < 0.25) else YELLOW
+            age_text = f"{age*1000:.0f} ms" if age is not None else "n/a"
+            print(f"  last cmd age: {age_color}{age_text}{RESET}")
+            for i in range(0, 12, 3):
+                leg = JOINT_NAMES[i].split('_')[0]
+                kp_h, kd_h = self.low_cmd.motor_cmd[i].kp,     self.low_cmd.motor_cmd[i].kd
+                kp_t, kd_t = self.low_cmd.motor_cmd[i+1].kp,   self.low_cmd.motor_cmd[i+1].kd
+                kp_c, kd_c = self.low_cmd.motor_cmd[i+2].kp,   self.low_cmd.motor_cmd[i+2].kd
+                print(f"  {leg:3s}:  hip kp={kp_h:6.2f} kd={kd_h:5.2f}   "
+                      f"thigh kp={kp_t:6.2f} kd={kd_t:5.2f}   "
+                      f"calf kp={kp_c:6.2f} kd={kd_c:5.2f}")
+        print()
+
+        # ─── Feedforward Torques (cmd) vs Estimated Torques (state) ───
+        # tau on rt/lowcmd is the feedforward term Sport Mode adds on top
+        # of its low-PD tracking.  tau_est on rt/lowstate is the actual
+        # motor torque inferred from current.  Comparing them shows how
+        # much of the "hold" load is FF vs PD: when FF dominates, |tau|
+        # on the cmd side is large and kp/kd are small.
+        print(f"{BOLD}── Joint Torques (N·m) ─────────────────────────────────────────{RESET}")
+        if self.low_cmd is None:
+            print(f"  {YELLOW}(no LowCmd_ — cmd tau unavailable; showing tau_est only){RESET}")
+            for i in range(0, 12, 3):
+                leg = JOINT_NAMES[i].split('_')[0]
+                te_h = self.low_state.motor_state[i].tau_est
+                te_t = self.low_state.motor_state[i+1].tau_est
+                te_c = self.low_state.motor_state[i+2].tau_est
+                print(f"  {leg:3s}:  est  hip={te_h:+7.2f}  thigh={te_t:+7.2f}  calf={te_c:+7.2f}")
+        else:
+            print(f"  {'leg':<5}{'cmd_hip':>9} {'est_hip':>9}   "
+                  f"{'cmd_thi':>9} {'est_thi':>9}   "
+                  f"{'cmd_clf':>9} {'est_clf':>9}")
+            for i in range(0, 12, 3):
+                leg = JOINT_NAMES[i].split('_')[0]
+                tc_h = self.low_cmd.motor_cmd[i].tau
+                tc_t = self.low_cmd.motor_cmd[i+1].tau
+                tc_c = self.low_cmd.motor_cmd[i+2].tau
+                te_h = self.low_state.motor_state[i].tau_est
+                te_t = self.low_state.motor_state[i+1].tau_est
+                te_c = self.low_state.motor_state[i+2].tau_est
+                print(f"  {leg:<5}{tc_h:+9.2f} {te_h:+9.2f}   "
+                      f"{tc_t:+9.2f} {te_t:+9.2f}   "
+                      f"{tc_c:+9.2f} {te_c:+9.2f}")
+        print()
+
         # ─── Foot Forces ──────────────────────────────────────────────
         print(f"{BOLD}── Foot Forces (raw) ───────────────────────────────────────────{RESET}")
         # foot order: FR=0, FL=1, RR=2, RL=3 on Go2
@@ -267,6 +335,21 @@ class PoseDisplay:
             ]
             for i in range(12):
                 row.append(f"{self.low_state.motor_state[i].q:.4f}")
+            # KP, KD, q_cmd, tau_ff from rt/lowcmd (empty cells when no
+            # LowCmd_ yet); tau_est always from rt/lowstate.
+            if self.low_cmd is not None:
+                for i in range(12):
+                    row.append(f"{self.low_cmd.motor_cmd[i].kp:.4f}")
+                for i in range(12):
+                    row.append(f"{self.low_cmd.motor_cmd[i].kd:.4f}")
+                for i in range(12):
+                    row.append(f"{self.low_cmd.motor_cmd[i].q:.4f}")
+                for i in range(12):
+                    row.append(f"{self.low_cmd.motor_cmd[i].tau:.4f}")
+            else:
+                row.extend([""] * 48)
+            for i in range(12):
+                row.append(f"{self.low_state.motor_state[i].tau_est:.4f}")
             for i in range(4):
                 row.append(f"{self.low_state.foot_force[i]}")
             self.log_writer.writerow(row)
@@ -293,6 +376,11 @@ def main():
 
     sub = ChannelSubscriber('rt/lowstate', LowState_)
     sub.Init(display.lowstate_callback, 10)
+
+    # Also listen on rt/lowcmd to read the kp/kd that the active controller
+    # (Sport Mode, handshake, or our own low-level publisher) is sending.
+    sub_cmd = ChannelSubscriber('rt/lowcmd', LowCmd_)
+    sub_cmd.Init(display.lowcmd_callback, 10)
 
     period = 1.0 / args.rate
     print(f"Displaying pose at {args.rate}Hz. Press Ctrl+C to exit.")

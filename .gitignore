@@ -13,7 +13,7 @@ data/real/*
 *.pt
 *.pth
 *.ckpt
-models/
+old_models/
 
 # Environment
 .env

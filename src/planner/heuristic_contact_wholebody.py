@@ -69,27 +69,74 @@ KP_SUPPORT_SOFT = 55.0
 KD_SUPPORT_SOFT = 5.5
 
 
+# Static gravity-compensation FF torques for support tripod, in N·m.
+# Indexed by leg base index in the per-leg ordering (FR=0, FL=3, RR=6, RL=9).
+# Per-leg tuple is (hip, thigh, calf) feedforward torque.
+#
+# Source: Sport Mode rt/lowcmd capture during handshake hold (5 snapshots,
+# averaged across 4 tightly-clustered captures with capture 4 outlier excluded).
+# Joint positions at capture matched WEIGHT_SHIFT_POS exactly. Values are
+# pose-sensitive — recapture if WEIGHT_SHIFT_POS changes.
+#
+# FR is excluded by design: Sport Mode commands tau=0 on FR throughout handshake.
+#
+# SAFETY: First robot test with --gravity-ff should be done with the button
+# absent / out of reach. The FF torques are static at one pose; if the
+# controller transitions through postures other than WEIGHT_SHIFT_POS during
+# extend+hold, the FF values are no longer correct and may push the support
+# legs in unexpected directions. Verify the support tripod holds steady at
+# the new posture for ~5 seconds before any contact attempt.
+SUPPORT_GRAVITY_FF = {
+    3: (-0.20, +3.08, +9.70),  # FL  (hip, thigh, calf)
+    6: (-0.92, +2.89, +6.89),  # RR
+    9: (+2.60, +3.49, +8.51),  # RL
+}
+
+
 class HeuristicContactWholeBody(HeuristicContactGuided):
     """Whole-body compliance: FR + support legs soften during extend+hold."""
 
     # Class-level tags read by StageDRecorder. ``collection_mode`` flips
-    # the dataset loader's format detection to v3; ``gain_schedule`` is
+    # the dataset loader's format detection to v3. ``gain_schedule`` is
     # written as a root HDF5 attribute and identifies the gain set used
-    # at collection time so post-hoc analysis can correlate behavior
-    # with gains across collection sessions.
+    # at collection time; it is set per-instance below so deployment-time
+    # KP overrides are reflected in the metadata.
     collection_mode: str = "wholebody_guided"
-    gain_schedule:   str = "wholebody_v2_kpsupport55"
 
-    def __init__(self, *args, **kwargs):
+    # Defaults match the historical module-level constants
+    # KP_SUPPORT_SOFT / KD_SUPPORT_SOFT for backwards compatibility.
+    DEFAULT_KP_SUPPORT_SOFT: float = KP_SUPPORT_SOFT  # 55.0
+    DEFAULT_KD_SUPPORT_SOFT: float = KD_SUPPORT_SOFT  # 5.5
+
+    def __init__(
+        self,
+        *args,
+        kp_support_soft: float = DEFAULT_KP_SUPPORT_SOFT,
+        kd_support_soft: float = DEFAULT_KD_SUPPORT_SOFT,
+        **kwargs,
+    ):
+        # gravity_ff_enabled / gravity_ff_body_mass / gravity_ff_phases are
+        # accepted by the base class HeuristicContact; we just let them flow
+        # through **kwargs so this subclass does not need to know about them.
         super().__init__(*args, **kwargs)
         # Parent already set self._compliance_active = True. The override
         # in _send_cmd reads that flag and the current phase to broaden
-        # the soft-gain branch to cover the support legs.
+        # the soft-gain branch to cover the support legs, and now also
+        # reads the per-instance gain values configured here.
+        self._kp_support_soft = float(kp_support_soft)
+        self._kd_support_soft = float(kd_support_soft)
+        # Encode the actual KP into the metadata string so downstream
+        # validators / analysis can identify off-default tuning runs.
+        self.gain_schedule = (
+            f"wholebody_v2_kpsupport{int(self._kp_support_soft)}"
+        )
         self._wholebody_banner_emitted = False
         logger.info(
             "HeuristicContactWholeBody initialised — FR + support legs "
-            "soften (KP_SUPPORT_SOFT=%.1f) during extend+hold.",
-            KP_SUPPORT_SOFT,
+            "soften (kp_support_soft=%.1f kd_support_soft=%.1f) during extend+hold; "
+            "gravity_ff_enabled=%s.",
+            self._kp_support_soft, self._kd_support_soft,
+            self._gravity_ff_enabled,
         )
 
     def execute(self, *args, **kwargs):
@@ -127,11 +174,21 @@ class HeuristicContactWholeBody(HeuristicContactGuided):
                   and self._compliance_active
                   and self._phase in ("extend", "hold")):
                 # NEW: support legs soften alongside FR during extend+hold.
-                self._low_cmd.motor_cmd[i].kp = KP_SUPPORT_SOFT
-                self._low_cmd.motor_cmd[i].kd = KD_SUPPORT_SOFT
+                # Per-instance values so deployment can sweep KP_SUPPORT_SOFT
+                # without editing module constants.
+                self._low_cmd.motor_cmd[i].kp = self._kp_support_soft
+                self._low_cmd.motor_cmd[i].kd = self._kd_support_soft
             else:
                 self._low_cmd.motor_cmd[i].kp = KP_STABLE
                 self._low_cmd.motor_cmd[i].kd = KD_STABLE
+
+        # Dynamic gravity-comp FF (analytical calf + empirical thigh) is
+        # implemented in HeuristicContact._maybe_apply_gravity_ff. It reads
+        # gravity_ff_enabled / gravity_ff_phases / gravity_ff_body_mass off
+        # self, all set on the base class. Calling the inherited helper
+        # here keeps the FF policy in one place and lets the base
+        # controller apply it as well.
+        self._maybe_apply_gravity_ff()
 
         self._low_cmd.crc = self._crc.Crc(self._low_cmd)
         self._pub.Write(self._low_cmd)

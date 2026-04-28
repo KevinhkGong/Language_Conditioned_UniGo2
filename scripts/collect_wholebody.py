@@ -94,6 +94,7 @@ from src.perception.grounding import Go2Camera, VisualGrounder
 from src.planner.heuristic_contact import (
     DEFAULT_INTERFACE,
     CONTACT_PROXIMITY_M,
+    GO2_NOMINAL_MASS_KG,
 )
 from src.planner.heuristic_contact_wholebody import HeuristicContactWholeBody
 from src.data.grounding_thread import GroundingThread
@@ -355,10 +356,18 @@ def _build_runtime(args) -> Runtime:
     logger.info("Constructing VisualGrounder (SAM2 + GroundingDINO + DAV2)…")
     grounder = VisualGrounder()
 
-    logger.info("Constructing HeuristicContactWholeBody…")
+    logger.info(
+        "Constructing HeuristicContactWholeBody (kp_support_soft=%.2f, "
+        "kd_support_soft=%.2f, gravity_ff_enabled=%s, ff_body_mass=%.2f kg)…",
+        args.rear_kp, args.rear_kd, args.gravity_ff, args.ff_body_mass,
+    )
     heuristic = HeuristicContactWholeBody(
         network_interface=args.interface,
         already_initialized=True,
+        kp_support_soft=args.rear_kp,
+        kd_support_soft=args.rear_kd,
+        gravity_ff_enabled=args.gravity_ff,
+        gravity_ff_body_mass=args.ff_body_mass,
     )
 
     logger.info(f"Constructing AudioLiveDetector (device={args.mic_index}, "
@@ -504,6 +513,15 @@ def run_one_episode(rt: Runtime, cfg: EpisodeConfig) -> Optional[EpisodeSummary]
         "press_offset_y":              np.float32(PRESS_OFFSET_Y),
         "nav_extra_forward_m":         np.float32(NAV_EXTRA_FORWARD_M),
         "y_sit_stand_drift_comp":      np.float32(Y_SIT_STAND_DRIFT_COMP),
+        # Collection regime — recorded so the trainer can filter v3 episodes
+        # collected with gravity FF (clean body dynamics, only FR-side human
+        # contribution) from earlier human-stabilized episodes. Support-leg
+        # gains are also recorded since collection lowers them from the
+        # historical 55/5.5 to 35/3.5 once FF supplies static torque.
+        "gravity_ff_enabled":          bool(getattr(rt.heuristic, "_gravity_ff_enabled", False)),
+        "gravity_ff_body_mass_kg":     np.float32(getattr(rt.heuristic, "_gravity_ff_body_mass", 0.0)),
+        "kp_support_soft":             np.float32(getattr(rt.heuristic, "_kp_support_soft", 0.0)),
+        "kd_support_soft":             np.float32(getattr(rt.heuristic, "_kd_support_soft", 0.0)),
     }
     recorder.begin_episode(initial_metadata)
 
@@ -689,6 +707,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cardboard-test",    action="store_true",
                    help="First-time-on-new-gain-schedule mode. Caps run at "
                         "2 episodes and prints an extra-loud warning.")
+    p.add_argument("--rear-kp",           type=float, default=35.0,
+                   help="kp_support_soft for FL/RR/RL during extend+hold. "
+                        "Default 35 (collection-only — lower than the legacy "
+                        "55 because gravity FF now supplies the static "
+                        "torque, leaving PD to handle damping and intentional "
+                        "operator translations). Run a pre-collection sanity "
+                        "test with Person 2's hands off before committing to "
+                        "a session; if rear sags or the body resists Person "
+                        "2's translations, retune.")
+    p.add_argument("--rear-kd",           type=float, default=3.5,
+                   help="kd_support_soft for FL/RR/RL during extend+hold. "
+                        "Default 3.5 (preserves the 0.1 KD/KP ratio of the "
+                        "legacy 55/5.5 regime).")
+    p.add_argument("--gravity-ff",        action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Apply dynamic gravity-comp FF on FL/RR/RL during "
+                        "lift/extend/hold/retract_*. Default True for "
+                        "collection — body holds posture without Person 2 "
+                        "supporting the rear, so achieved_delta_q reflects "
+                        "only FR-side demonstration. Pass --no-gravity-ff to "
+                        "fall back to the legacy human-stabilized regime.")
+    p.add_argument("--ff-body-mass",      type=float,
+                   default=GO2_NOMINAL_MASS_KG,
+                   help="Body mass (kg) used to scale gravity FF torques. "
+                        f"Default {GO2_NOMINAL_MASS_KG}; raise if rear still "
+                        f"sags during pre-collection sanity check, lower if "
+                        f"FF overshoots.")
     p.add_argument("--verbose",           action="store_true")
     return p
 

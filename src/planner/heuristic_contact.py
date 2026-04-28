@@ -66,12 +66,13 @@ Additions for audio-based contact verification (v2.1 spec, April 21 2026):
       metadata. Default behavior (audio_detector=None) is unchanged.
 """
 
+import math
 import time
 import logging
 import threading
 import concurrent.futures
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Set, Tuple
 
 import numpy as np
 
@@ -165,6 +166,15 @@ SIT_POS = [
     +0.418, +1.247, -2.776,   # RL
 ]
 
+# Weight-shift target posture: small lateral hip abduction + slight thigh
+# lower on the FL/RL side, RR hip outward. Empirically tuned with KP_STABLE=100
+# / tau=0; produces a bounded few-degree static sag during extend+hold that's
+# operationally fine for baseline_2. The Stage C waypoint head was trained at
+# this posture, so deployment-time waypoint predictions remain aligned.
+#
+# A handshake-tripod variant of this constant was tested (deeper rear squat,
+# matching Sport Mode's hold pose). It was reverted because that posture is
+# only stable with feedforward torque, which our base PD-only path lacks.
 WEIGHT_SHIFT_POS = list(STAND_POS)
 WEIGHT_SHIFT_POS[3]  = STAND_POS[3]  - 0.30   # FL_hip inward
 WEIGHT_SHIFT_POS[9]  = STAND_POS[9]  - 0.25   # RL_hip inward
@@ -196,6 +206,113 @@ FR_PRESS_OFFSET_GROUND = np.array([+0.04, -1.0, +0.8])   # forward + calf pushes
 # How far the calf retracts during the curl step of retract
 # Tucks foot clear of button before rotating leg back
 FR_RETRACT_CURL_CALF_OFFSET = -0.5   # relative to current calf at press position
+
+
+# ──────────────────────────────────────────────
+# Dynamic gravity-compensation FF (shared by base + WholeBody subclass)
+# ──────────────────────────────────────────────
+#
+# Approximates per-motor static gravity-comp torque at the current joint
+# configuration. Applied as motor_cmd[i].tau on top of the existing PD
+# command, so kp/kd only need to do tracking work — gravity load is held
+# by the FF term.
+#
+# Phases where this fires are configurable per controller; default is the
+# weight-bearing tripod set {lift, extend, hold, retract_curl, retract_rotate,
+# retract_extend}. Quadripod transition phases (sit_to_stand, weight_shift,
+# weight_unshift, settle, lower_to_sit) are excluded by default — they involve
+# rapid posture change where a mismatched FF can fight the transition.
+#
+# Modeling choices, with rationale:
+#
+#   - Calf: full analytical J_z^T · F using the same simplified FK as
+#     _estimate_fr_foot. Sign matches Sport Mode handshake captures;
+#     magnitude is ~70% of Sport Mode at default body mass. Tunable via
+#     gravity_ff_body_mass on the controller.
+#
+#   - Thigh: empirical scalar (the analytical J_z^T·F gives the wrong sign
+#     in deep-squat postures because the simple model ignores body CoM
+#     offset and per-segment leg masses). Sport Mode handshake captures
+#     give ~+3 N·m on each support thigh at ~12 kg / 3-leg load. We scale
+#     that by per-leg load relative to the same nominal so the magnitude
+#     adapts to body-mass tuning, even though it stays roughly posture-
+#     independent.
+#
+#   - Hip: 0. The simple FK has hip rotation about body-X, which doesn't
+#     change foot z and so can't be reached by this gravity-only model.
+#     Sport Mode hip captures are small (-1 to +3 N·m) and leg-asymmetric;
+#     not worth the extra calibration effort given how tiny the moment is.
+#
+# FR is excluded from FF whenever it's airborne (matches Sport Mode's
+# tau=0 on FR throughout the handshake).
+GO2_NOMINAL_MASS_KG  = 15.0
+GO2_GRAVITY          = 9.81
+SUPPORT_THIGH_FF_BASELINE_NM = 3.0   # at 1/3·12kg ≈ 39N per leg (Sport Mode median)
+GRAVITY_FF_DEFAULT_PHASES: Tuple[str, ...] = (
+    "lift", "extend", "hold",
+    "retract_curl", "retract_rotate", "retract_extend",
+)
+
+
+def _per_leg_gravity_ff(
+    q_thigh: float,
+    q_calf: float,
+    w_per_leg_n: float,
+) -> Tuple[float, float, float]:
+    """Approximate static gravity-comp torque (hip, thigh, calf) for one leg.
+
+    See module-level docstring above for the modeling decisions and limits.
+    """
+    sin_tc = math.sin(q_thigh + q_calf)
+
+    # Hip: 0 in the simple FK (rotation axis doesn't move foot z).
+    tau_hip = 0.0
+
+    # Thigh: empirical, scaled by per-leg load relative to the nominal that
+    # SUPPORT_THIGH_FF_BASELINE_NM was measured at.
+    nominal_w = GO2_NOMINAL_MASS_KG * GO2_GRAVITY / 3.0
+    tau_thigh = SUPPORT_THIGH_FF_BASELINE_NM * (w_per_leg_n / nominal_w)
+
+    # Calf: analytical. Foot upward reaction with Z-Jacobian = L_C·sin(thigh+calf);
+    # motor must apply opposite to resist the gravity-induced bend, hence the
+    # leading negative sign.
+    L_CALF = 0.213
+    tau_calf = -L_CALF * sin_tc * w_per_leg_n
+
+    return tau_hip, tau_thigh, tau_calf
+
+
+def compute_gravity_ff_torques(
+    q_actual: Iterable[float],
+    *,
+    fr_in_air: bool,
+    body_mass_kg: float = GO2_NOMINAL_MASS_KG,
+) -> np.ndarray:
+    """Build a (12,) feed-forward torque array for the current pose.
+
+    Indexing matches the controller's canonical FR/FL/RR/RL × hip/thigh/calf
+    order. FR slot is 0 by default when ``fr_in_air`` is True (matches Sport
+    Mode handshake behaviour); set ``fr_in_air=False`` for quadripod phases
+    where FR should also bear weight.
+    """
+    q = list(q_actual)
+    if len(q) < 12:
+        raise ValueError(f"q_actual must have 12 entries, got {len(q)}")
+
+    num_support = 3 if fr_in_air else 4
+    if num_support <= 0 or body_mass_kg <= 0:
+        return np.zeros(12, dtype=np.float32)
+    w_per_leg = body_mass_kg * GO2_GRAVITY / num_support
+
+    tau = np.zeros(12, dtype=np.float32)
+    if not fr_in_air:
+        tau_fr = _per_leg_gravity_ff(q[1], q[2], w_per_leg)
+        tau[0:3] = tau_fr
+    for base_idx in (3, 6, 9):
+        tau_leg = _per_leg_gravity_ff(
+            q[base_idx + 1], q[base_idx + 2], w_per_leg)
+        tau[base_idx:base_idx + 3] = tau_leg
+    return tau
 
 
 # ──────────────────────────────────────────────
@@ -233,7 +350,62 @@ class HeuristicContact:
         self,
         network_interface: str = DEFAULT_INTERFACE,
         already_initialized: bool = False,
+        fr_waypoints: Optional[Dict[str, np.ndarray]] = None,
+        stage_d_inference: Optional[Any] = None,
+        stage_d_phases: Optional[Set[str]] = None,
+        grounding_getter: Optional[Callable[[], Optional[np.ndarray]]] = None,
+        stage_d_residual_mask: Optional[np.ndarray] = None,
+        gravity_ff_enabled: bool = False,
+        gravity_ff_body_mass: float = GO2_NOMINAL_MASS_KG,
+        gravity_ff_phases: Optional[Set[str]] = None,
     ):
+        # ── Optional deployment hooks (Friday demo) ────────────────────────
+        # When ``fr_waypoints`` is provided, the lift/extend/hold FR targets
+        # come from the dict instead of STAND_POS + module-level offsets.
+        # When ``stage_d_inference`` is provided, a (12,) residual is added
+        # to target_q every control step whose phase is in ``stage_d_phases``
+        # (default {"lift", "extend", "hold"}). All four params default to
+        # None / preserve baseline behavior; setting any one alone is safe.
+        self._fr_waypoints: Optional[Dict[str, np.ndarray]] = fr_waypoints
+        self._stage_d = stage_d_inference
+        self._stage_d_phases: Set[str] = (
+            set(stage_d_phases) if stage_d_phases is not None
+            else {"lift", "extend", "hold"}
+        )
+        self._grounding_getter = grounding_getter
+        # Optional element-wise multiplier applied to the (12,) Stage D
+        # residual before it is added to the joint command. None means
+        # "apply residual unmasked" (default behaviour). Used by deployment
+        # scripts to e.g. zero rear-leg residuals for diagnostic comparison.
+        if stage_d_residual_mask is not None:
+            mask = np.asarray(stage_d_residual_mask, dtype=np.float32)
+            if mask.shape != (12,):
+                raise ValueError(
+                    f"stage_d_residual_mask must be (12,), got {mask.shape}")
+            self._stage_d_residual_mask: Optional[np.ndarray] = mask
+        else:
+            self._stage_d_residual_mask = None
+        # Dynamic gravity-comp FF. When True, _send_cmd applies an analytical
+        # per-leg static torque (calf) plus an empirical thigh constant during
+        # the configured phases (default {lift, extend, hold, retract_*}). FR
+        # is excluded while airborne. Subclasses inherit this directly via
+        # super().__init__; no per-subclass logic is needed.
+        self._gravity_ff_enabled = bool(gravity_ff_enabled)
+        self._gravity_ff_body_mass = float(gravity_ff_body_mass)
+        self._gravity_ff_phases: Set[str] = (
+            set(gravity_ff_phases) if gravity_ff_phases is not None
+            else set(GRAVITY_FF_DEFAULT_PHASES)
+        )
+        # Cached "last valid" target_pos_base for Stage D state. Filled at
+        # execute() entry from self._target_offset; refreshed each step from
+        # ``grounding_getter`` when one is configured. Never NaN — Stage D
+        # was trained on continuous values only.
+        self._stage_d_target_cache: Optional[np.ndarray] = None
+        # Phase progress in [0, 1] within the current phase, set in
+        # _control_loop and read by the Stage D state builder. 0.0 outside
+        # of an active phase.
+        self._phase_progress: float = 0.0
+
         self._crc        = CRC()
         self._low_state  = None
         self._low_cmd    = unitree_go_msg_dds__LowCmd_()
@@ -401,6 +573,12 @@ class HeuristicContact:
             np.asarray(fr_press_offset_ground, dtype=np.float64)
             if fr_press_offset_ground is not None
             else FR_PRESS_OFFSET_GROUND
+        )
+
+        # Seed the Stage D target cache with the initial standoff target so
+        # foot_to_target_error has a sensible value before grounding fires.
+        self._stage_d_target_cache = (
+            np.asarray(target_offset_xyz, dtype=np.float32).copy()
         )
 
         if use_foot_force:
@@ -603,17 +781,22 @@ class HeuristicContact:
         # ── lift FR ───────────────────────────────────────────────────
         elif self._phase == "lift":
             alpha    = min(self._phase_step / STEPS_LIFT, 1.0)
+            self._phase_progress = alpha
             target_q = list(self._weight_shift_end)
             fr_s = np.array([
                 WEIGHT_SHIFT_POS[FR_HIP],
                 WEIGHT_SHIFT_POS[FR_THIGH],
                 WEIGHT_SHIFT_POS[FR_CALF],
             ])
-            fr_l = np.array([
-                STAND_POS[FR_HIP]   + lift_offset[0],
-                STAND_POS[FR_THIGH] + lift_offset[1],
-                STAND_POS[FR_CALF]  + lift_offset[2],
-            ])
+            if self._fr_waypoints is not None:
+                fr_l = np.asarray(
+                    self._fr_waypoints["lift"], dtype=np.float64)
+            else:
+                fr_l = np.array([
+                    STAND_POS[FR_HIP]   + lift_offset[0],
+                    STAND_POS[FR_THIGH] + lift_offset[1],
+                    STAND_POS[FR_CALF]  + lift_offset[2],
+                ])
             target_q[FR_HIP]   = (1-alpha)*fr_s[0] + alpha*fr_l[0]
             target_q[FR_THIGH] = (1-alpha)*fr_s[1] + alpha*fr_l[1]
             target_q[FR_CALF]  = (1-alpha)*fr_s[2] + alpha*fr_l[2]
@@ -631,12 +814,17 @@ class HeuristicContact:
         # ── extend / press-down FR ────────────────────────────────────
         elif self._phase == "extend":
             alpha    = min(self._phase_step / STEPS_EXTEND, 1.0)
+            self._phase_progress = alpha
             target_q = list(self._lift_end_pos)
-            fr_e = np.array([
-                STAND_POS[FR_HIP]   + extend_offset[0],
-                STAND_POS[FR_THIGH] + extend_offset[1],
-                STAND_POS[FR_CALF]  + extend_offset[2],
-            ])
+            if self._fr_waypoints is not None:
+                fr_e = np.asarray(
+                    self._fr_waypoints["extend"], dtype=np.float64)
+            else:
+                fr_e = np.array([
+                    STAND_POS[FR_HIP]   + extend_offset[0],
+                    STAND_POS[FR_THIGH] + extend_offset[1],
+                    STAND_POS[FR_CALF]  + extend_offset[2],
+                ])
             fr_l = np.array([
                 self._lift_end_pos[FR_HIP],
                 self._lift_end_pos[FR_THIGH],
@@ -655,9 +843,20 @@ class HeuristicContact:
                 self._phase      = "hold"
                 self._phase_step = 0
                 self._hold_pos   = list(target_q)
+                # When Stage C waypoints are wired up, the press waypoint
+                # supersedes the extend target as the hold pose. Difference
+                # is small in training data, so a step transition is fine.
+                if self._fr_waypoints is not None:
+                    press_fr = self._fr_waypoints["press"]
+                    self._hold_pos[FR_HIP]   = float(press_fr[0])
+                    self._hold_pos[FR_THIGH] = float(press_fr[1])
+                    self._hold_pos[FR_CALF]  = float(press_fr[2])
 
         # ── hold + detect contact ─────────────────────────────────────
         elif self._phase == "hold":
+            # Match recorder.PHASE_DURATION_S["hold"] = 3.0s = 1500 steps so
+            # the deployment phase_progress matches what Stage D was trained on.
+            self._phase_progress = min(self._phase_step / 1500.0, 1.0)
             target_q = list(self._hold_pos)
             # Record actual positions during hold for training data
             self._joint_traj.append(list(actual))
@@ -895,9 +1094,91 @@ class HeuristicContact:
         # interpolation — not only at phase transitions.
         self.current_waypoint_fr = np.array(target_q[0:3], dtype=np.float32)
 
+        # ── Stage D residual (deployment) ─────────────────────────────
+        # When a Stage D inference handle is configured and the current
+        # phase is in self._stage_d_phases, build the 33-dim state vector
+        # (training_data_spec_v3.md §5.1), call the residual policy, and
+        # add the (12,) result to target_q before publishing.
+        if (self._stage_d is not None
+                and self._phase in self._stage_d_phases):
+            target_q = self._apply_stage_d_residual(
+                target_q=target_q, actual=actual,
+                roll=roll, pitch=pitch,
+            )
+
         # Cache last command and send
         self._last_target_q = target_q
         self._send_cmd(target_q)
+
+    def _apply_stage_d_residual(
+        self,
+        target_q: list,
+        actual: list,
+        roll: float,
+        pitch: float,
+    ) -> list:
+        """Add the Stage D (33→12) residual to target_q during active phases.
+
+        Returns a new list with the per-joint correction applied. If the
+        target cache cannot be refreshed and was never seeded, returns the
+        input unchanged — the residual is skipped rather than poisoned with
+        NaN, since Stage D was trained on continuous values only.
+        """
+        # Refresh target_pos_base from the grounding thread when one is
+        # configured. Keep the previous value if the call returns None.
+        if self._grounding_getter is not None:
+            try:
+                fresh = self._grounding_getter()
+            except Exception as e:
+                logger.warning(f"grounding_getter raised: {e}")
+                fresh = None
+            if fresh is not None:
+                fresh_arr = np.asarray(fresh, dtype=np.float32)
+                if fresh_arr.shape == (3,) and not np.isnan(fresh_arr).any():
+                    self._stage_d_target_cache = fresh_arr.copy()
+
+        target = self._stage_d_target_cache
+        if target is None:
+            return target_q
+
+        # Pull the additional motor / IMU fields needed for the state vector.
+        # Reading under the same lock as the main read keeps these consistent
+        # with the actual / roll / pitch already in hand.
+        with self._state_lock:
+            ms = self._low_state.motor_state
+            dq        = [ms[i].dq      for i in range(12)]
+            tau_est   = [ms[i].tau_est for i in range(12)]
+            gyro      = list(self._low_state.imu_state.gyroscope[0:3])
+            accel     = list(self._low_state.imu_state.accelerometer[0:3])
+
+        fr_foot_fk = self._estimate_fr_foot(actual)
+        foot_to_target_err = (target.astype(np.float32) - fr_foot_fk).astype(np.float32)
+
+        state = np.empty(33, dtype=np.float32)
+        state[0:3]   = np.asarray(actual[0:3], dtype=np.float32)
+        state[3:6]   = np.asarray(dq[0:3],    dtype=np.float32)
+        state[6:9]   = foot_to_target_err
+        state[9:12]  = np.asarray(target_q[0:3], dtype=np.float32)
+        state[12]    = float(self._phase_progress)
+        state[13]    = float(roll)
+        state[14]    = float(pitch)
+        state[15:27] = np.asarray(tau_est, dtype=np.float32)
+        state[27:30] = np.asarray(gyro,    dtype=np.float32)
+        state[30:33] = np.asarray(accel,   dtype=np.float32)
+
+        try:
+            residual = self._stage_d.predict(state)
+        except Exception as e:
+            logger.warning(f"Stage D inference failed: {e} — residual skipped")
+            return target_q
+
+        if self._stage_d_residual_mask is not None:
+            residual = residual * self._stage_d_residual_mask
+
+        out = list(target_q)
+        for i in range(12):
+            out[i] = float(target_q[i]) + float(residual[i])
+        return out
 
     def _send_cmd(self, target_q: list) -> None:
         for i in range(12):
@@ -932,8 +1213,45 @@ class HeuristicContact:
                 self._low_cmd.motor_cmd[i].kp = KP_STABLE
                 self._low_cmd.motor_cmd[i].kd = KD_STABLE
 
+        self._maybe_apply_gravity_ff()
+
         self._low_cmd.crc = self._crc.Crc(self._low_cmd)
         self._pub.Write(self._low_cmd)
+
+    def _maybe_apply_gravity_ff(self) -> None:
+        """Patch motor_cmd[i].tau with dynamic static gravity-comp torques.
+
+        Called from ``_send_cmd`` (and the WholeBody subclass override) after
+        the per-motor gain loop has set ``tau=0``. No-op when
+        ``self._gravity_ff_enabled`` is False or the current phase is not in
+        ``self._gravity_ff_phases``. Reads the latest joint positions from
+        ``rt/lowstate`` under the existing state lock so FF tracks the actual
+        pose rather than the commanded pose (which would diverge under sag).
+        """
+        if not self._gravity_ff_enabled:
+            return
+        if self._phase not in self._gravity_ff_phases:
+            return
+        if self._low_state is None:
+            return
+        with self._state_lock:
+            q_actual = [self._low_state.motor_state[i].q for i in range(12)]
+        # FR is airborne for the full lift→retract_extend window; the default
+        # gravity_ff_phases set is exactly that window so this stays True
+        # there. If a caller adds a quadripod phase to gravity_ff_phases
+        # they almost certainly want fr_in_air=False; we only have phase
+        # information here so use the phase-derived flag.
+        fr_in_air = self._phase in (
+            "lift", "extend", "hold",
+            "retract_curl", "retract_rotate", "retract_extend",
+        )
+        tau_ff = compute_gravity_ff_torques(
+            q_actual,
+            fr_in_air=fr_in_air,
+            body_mass_kg=self._gravity_ff_body_mass,
+        )
+        for i in range(12):
+            self._low_cmd.motor_cmd[i].tau = float(tau_ff[i])
 
     # ──────────────────────────────────────────────
     # Mode switching
@@ -1063,6 +1381,13 @@ if __name__ == "__main__":
     parser.add_argument("--foot-force",  action="store_true",
                         help="Enable foot-force contact detection stub "
                              "(disabled by default — unreliable on this hardware)")
+    parser.add_argument("--gravity-ff",  action="store_true",
+                        help="Apply dynamic gravity-comp FF on FL/RR/RL "
+                             "during lift/extend/hold/retract_*.")
+    parser.add_argument("--ff-body-mass", type=float, default=GO2_NOMINAL_MASS_KG,
+                        help="Body mass (kg) used to scale gravity FF torques. "
+                             f"Default {GO2_NOMINAL_MASS_KG}; raise if rear "
+                             f"still sags, lower if FF overshoots.")
     parser.add_argument("--dry-run",     action="store_true")
     args = parser.parse_args()
 
@@ -1073,6 +1398,7 @@ if __name__ == "__main__":
     print(f"Mode:       {args.mode}")
     print(f"Target:     ({args.target_x}, {args.target_y}, {args.target_z})")
     print(f"Foot force: {'enabled (stub)' if args.foot_force else 'disabled'}")
+    print(f"Gravity FF: {'ENABLED (mass={:.1f} kg)'.format(args.ff_body_mass) if args.gravity_ff else 'disabled'}")
     print(f"Audio:      disabled (CLI does not wire a detector; pass via script)")
     print("\nPhases: sit_to_stand → weight_shift → lift → extend → "
           "hold → retract → weight_unshift → settle → lower_to_sit → done")
@@ -1088,7 +1414,11 @@ if __name__ == "__main__":
     print("\nWARNING: Robot will sit down, stand in low-level, lift FR leg.")
     input("Press Enter to continue (Ctrl+C to abort)...\n")
 
-    controller = HeuristicContact(args.interface)
+    controller = HeuristicContact(
+        args.interface,
+        gravity_ff_enabled=args.gravity_ff,
+        gravity_ff_body_mass=args.ff_body_mass,
+    )
     print("✓ Connected")
 
     if args.dry_run:
