@@ -309,6 +309,12 @@ def load_episode(path: Path) -> dict | None:
         collection_mode = _attr_str(
             attrs, "collection_mode", default=_DEFAULT_COLLECTION_MODE)
         data_format_version = _detect_format_version(attrs)
+        # Optional metadata used by the v4 collection-regime filters. Default
+        # to empty string when an episode predates the metadata addition so
+        # the strict-equality filter naturally excludes those episodes.
+        gain_schedule_attr = _attr_str(attrs, "gain_schedule", default="")
+        camera_intrinsics_version = _attr_str(
+            attrs, "camera_intrinsics_version", default="")
 
         out = {
             "episode_id": episode_id,
@@ -324,6 +330,8 @@ def load_episode(path: Path) -> dict | None:
             "y_sit_stand_drift_comp": y_sit_stand_drift_comp,
             "collection_mode": collection_mode,
             "data_format_version": data_format_version,
+            "gain_schedule": gain_schedule_attr,
+            "camera_intrinsics_version": camera_intrinsics_version,
             # Phase transitions (12-dim each)
             "phase_transitions": pt,
             # Per-step arrays
@@ -563,21 +571,58 @@ def _list_episode_paths_multi(
     return sorted(paths)
 
 
+def _episode_passes_metadata_filters(
+    ep: dict,
+    *,
+    gain_schedule_filter: str | None,
+    intrinsics_version_filter: str | None,
+) -> bool:
+    """Apply collection-regime filters to a loaded episode dict.
+
+    Both filters are exact string matches against the corresponding HDF5
+    root attribute (``gain_schedule`` and ``camera_intrinsics_version``).
+    Episodes predating the metadata addition default to empty strings,
+    which won't match any non-None filter — i.e. they're correctly
+    excluded from filtered training sets.
+    """
+    if (gain_schedule_filter is not None
+            and ep.get("gain_schedule", "") != gain_schedule_filter):
+        return False
+    if (intrinsics_version_filter is not None
+            and ep.get("camera_intrinsics_version", "")
+                != intrinsics_version_filter):
+        return False
+    return True
+
+
 def build_stage_c_datasets(
     episodes_dirs: "list[Path] | Path",
     val_fraction: float = 0.2,
     seed: int = 42,
+    gain_schedule_filter: str | None = None,
+    intrinsics_version_filter: str | None = None,
 ) -> tuple[StageCDataset, StageCDataset]:
     """Build Stage C train/val datasets from one or more episode dirs.
 
     ``episodes_dirs`` may be a single Path (legacy) or a list. Missing
-    directories are treated as empty.
+    directories are treated as empty. ``gain_schedule_filter`` and
+    ``intrinsics_version_filter`` are exact-string root-attr filters used
+    to scope training to a single collection regime (e.g. v4: kpsupport35
+    + calib_2026_04). Both default to None (no filter).
     """
     paths = _list_episode_paths_multi(episodes_dirs)
     train_paths, val_paths = split_episodes_train_val(
         paths, val_fraction=val_fraction, seed=seed)
-    train_samples = _collect_stage_c(train_paths)
-    val_samples = _collect_stage_c(val_paths)
+    train_samples = _collect_stage_c(
+        train_paths,
+        gain_schedule_filter=gain_schedule_filter,
+        intrinsics_version_filter=intrinsics_version_filter,
+    )
+    val_samples = _collect_stage_c(
+        val_paths,
+        gain_schedule_filter=gain_schedule_filter,
+        intrinsics_version_filter=intrinsics_version_filter,
+    )
     return StageCDataset(train_samples), StageCDataset(val_samples)
 
 
@@ -587,13 +632,17 @@ def build_stage_d_datasets(
     seed: int = 42,
     phases: tuple[int, ...] = (0, 1, 2),
     format_filter: str | None = None,
+    gain_schedule_filter: str | None = None,
+    intrinsics_version_filter: str | None = None,
 ) -> tuple[StageDDataset, StageDDataset]:
     """Build Stage D train/val datasets from one or more episode dirs.
 
     ``episodes_dirs`` may be a single Path (legacy) or a list. Missing
     directories are treated as empty. ``format_filter`` of ``"v2"`` /
     ``"v3"`` keeps only episodes whose detected ``data_format_version``
-    matches; ``None`` keeps all.
+    matches; ``None`` keeps all. ``gain_schedule_filter`` and
+    ``intrinsics_version_filter`` are exact-string root-attr filters used
+    to scope training to a single collection regime.
     """
     if format_filter is not None and format_filter not in ("v2", "v3"):
         raise ValueError(
@@ -602,16 +651,34 @@ def build_stage_d_datasets(
     paths = _list_episode_paths_multi(episodes_dirs)
     train_paths, val_paths = split_episodes_train_val(
         paths, val_fraction=val_fraction, seed=seed)
-    train_samples = _collect_stage_d(train_paths, phases, format_filter)
-    val_samples   = _collect_stage_d(val_paths,   phases, format_filter)
+    train_samples = _collect_stage_d(
+        train_paths, phases, format_filter,
+        gain_schedule_filter=gain_schedule_filter,
+        intrinsics_version_filter=intrinsics_version_filter,
+    )
+    val_samples = _collect_stage_d(
+        val_paths, phases, format_filter,
+        gain_schedule_filter=gain_schedule_filter,
+        intrinsics_version_filter=intrinsics_version_filter,
+    )
     return StageDDataset(train_samples), StageDDataset(val_samples)
 
 
-def _collect_stage_c(paths: list[Path]) -> list[StageCSample]:
+def _collect_stage_c(
+    paths: list[Path],
+    gain_schedule_filter: str | None = None,
+    intrinsics_version_filter: str | None = None,
+) -> list[StageCSample]:
     out: list[StageCSample] = []
     for p in paths:
         ep = load_episode(p)
         if ep is None:
+            continue
+        if not _episode_passes_metadata_filters(
+            ep,
+            gain_schedule_filter=gain_schedule_filter,
+            intrinsics_version_filter=intrinsics_version_filter,
+        ):
             continue
         out.append(_stage_c_sample_from_episode(ep))
     return out
@@ -621,6 +688,8 @@ def _collect_stage_d(
     paths: list[Path],
     phases: tuple[int, ...],
     format_filter: str | None = None,
+    gain_schedule_filter: str | None = None,
+    intrinsics_version_filter: str | None = None,
 ) -> list[StageDSample]:
     phase_set = set(int(p) for p in phases)
     out: list[StageDSample] = []
@@ -629,6 +698,12 @@ def _collect_stage_d(
         if ep is None:
             continue
         if format_filter is not None and ep["data_format_version"] != format_filter:
+            continue
+        if not _episode_passes_metadata_filters(
+            ep,
+            gain_schedule_filter=gain_schedule_filter,
+            intrinsics_version_filter=intrinsics_version_filter,
+        ):
             continue
         for sample, _ in _iter_stage_d_from_episode(ep, phase_set):
             out.append(sample)

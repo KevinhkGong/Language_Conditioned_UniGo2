@@ -1,6 +1,5 @@
 {
   "data_dirs": [
-    "data/real/stage_d_v2",
     "data/real/stage_d_v3"
   ],
   "epochs": 200,
@@ -9,8 +8,10 @@
   "weight_decay": 0.0001,
   "val_fraction": 0.2,
   "seed": 42,
-  "out_dir": "models/stage_c",
+  "out_dir": "models/stage_c_v4",
   "device": "auto",
   "log_every": 10,
-  "no_save": false
+  "no_save": false,
+  "gain_schedule_filter": "wholebody_v2_kpsupport35",
+  "intrinsics_version_filter": "calib_2026_04"
 }

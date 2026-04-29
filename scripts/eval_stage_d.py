@@ -54,6 +54,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--phases",         default="0,1,2")
     p.add_argument("--device",         default="cpu")
+    p.add_argument(
+        "--gain-schedule-filter",
+        type=str,
+        default=None,
+        help="If set, only load episodes where root attr 'gain_schedule' "
+             "matches this exact string. Default: no filter.",
+    )
+    p.add_argument(
+        "--intrinsics-version-filter",
+        type=str,
+        default=None,
+        help="If set, only load episodes where root attr "
+             "'camera_intrinsics_version' matches this exact string. "
+             "Default: no filter.",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Where to write eval.json. If unset, writes to "
+             "<checkpoint_dir>/eval.json (existing behaviour). Created "
+             "if it does not exist.",
+    )
     return p.parse_args()
 
 
@@ -92,12 +115,19 @@ def main() -> None:
     # ── Rebuild val split ────────────────────────────────────────────
     data_paths = _csv_paths(args.data_dirs)
     phases = _csv_ints(args.phases)
+    if args.gain_schedule_filter is not None:
+        logger.info(f"gain_schedule_filter: {args.gain_schedule_filter!r}")
+    if args.intrinsics_version_filter is not None:
+        logger.info(
+            f"intrinsics_version_filter: {args.intrinsics_version_filter!r}")
     _, val_ds = build_stage_d_datasets(
         data_paths,
         val_fraction=args.val_fraction,
         seed=args.seed,
         phases=phases,
         format_filter=args.format_filter,
+        gain_schedule_filter=args.gain_schedule_filter,
+        intrinsics_version_filter=args.intrinsics_version_filter,
     )
     live_val_ids = sorted({s.episode_id for s in val_ds.samples})
     logger.info(f"Reproduced val episodes ({len(live_val_ids)}): {live_val_ids}")
@@ -248,7 +278,12 @@ def main() -> None:
               f"{_fmt_row(np.asarray(r['foot_to_target_error']))}")
 
     # ── Save ─────────────────────────────────────────────────────────
-    eval_path = ckpt_dir / "eval.json"
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = ckpt_dir
+    eval_path = out_dir / "eval.json"
     eval_path.write_text(json.dumps({
         "val_samples":             n_val,
         "val_episode_ids":         live_val_ids,

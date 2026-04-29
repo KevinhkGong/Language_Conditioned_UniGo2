@@ -75,14 +75,41 @@ from groundingdino.util.utils import get_phrases_from_posmap  # noqa: E402
 from sam2.build_sam import build_sam2  # noqa: E402
 from sam2.sam2_image_predictor import SAM2ImagePredictor  # noqa: E402
 
-# ── Camera constants ──────────────────────────────────────────────────────────
-# Intrinsics — derived from 120° HFOV + 1920×1080
-# fx = (W/2) / tan(HFOV/2) = 960 / tan(60°)
-_HFOV_DEG   = 120.0
+# ── Camera intrinsics ────────────────────────────────────────────────────────
+#
+# Calibrated camera intrinsics (plumb_bob model, obtained April 2026).
+# Validated against tape-measured ground truth at 3 positions:
+# residual error ~2 cm laterally. Replaces the URDF-derived approximation
+# below (fx=fy=554.3, cx=960, cy=540, no distortion) which gave
+# ~12 cm error and ~2.37× lateral over-scaling for off-centre detections.
+#
+# CAMERA_D follows OpenCV's plumb_bob ordering: [k1, k2, p1, p2, k3].
+CAMERA_K = np.array([
+    [1310.77826,    0.     , 1018.71143],
+    [   0.     , 1320.25059,  637.37672],
+    [   0.     ,    0.     ,    1.     ],
+], dtype=np.float64)
+CAMERA_D = np.array(
+    [-0.415971, 0.158898, -0.015395, -0.008031, 0.000000],
+    dtype=np.float64,
+)
+
+# Calibration version tag — recorders / metadata writers can read this so
+# downstream analysis can identify episodes captured under each intrinsics
+# regime. Bump this string when CAMERA_K / CAMERA_D are re-calibrated.
+CAMERA_INTRINSICS_VERSION = "calib_2026_04"
+
+# Image dimensions — used by helpers that need full-frame size.
 _IMG_W, _IMG_H = 1920, 1080
-_FX = _FY   = (_IMG_W / 2.0) / math.tan(math.radians(_HFOV_DEG / 2.0))  # ≈ 554.3
-_CX         = _IMG_W / 2.0   # 960.0
-_CY         = _IMG_H / 2.0   # 540.0
+
+# ── Legacy URDF-derived approximation (HISTORICAL REFERENCE — DO NOT USE) ────
+# Preserved so analyses or notebooks that hard-coded these values can still
+# resolve them. The unprojection path now goes through CAMERA_K / CAMERA_D.
+_HFOV_DEG_LEGACY   = 120.0
+_FX_LEGACY = _FY_LEGACY = (_IMG_W / 2.0) / math.tan(
+    math.radians(_HFOV_DEG_LEGACY / 2.0))   # ≈ 554.3
+_CX_LEGACY         = _IMG_W / 2.0   # 960.0
+_CY_LEGACY         = _IMG_H / 2.0   # 540.0
 
 # URDF-derived extrinsics — camera in robot base frame
 _CAM_FORWARD  =  0.327   # m
@@ -385,9 +412,29 @@ class VisualGrounder:
         """
         Unproject pixel (u, v) at metric depth to 3D point in camera frame.
         Camera optical convention: z-forward, x-right, y-down.
+
+        Two-step pipeline:
+          1. Undistort the pixel back into ``CAMERA_K``'s linear projection
+             frame using the plumb_bob distortion coefficients.
+          2. Unproject the corrected pixel using the calibrated focal lengths
+             and principal point.
+
+        ``cv2.undistortPoints`` with ``P=CAMERA_K`` returns undistorted pixel
+        coordinates in the same K (rather than normalised image coordinates),
+        so we can apply the standard pinhole formula on the result.
         """
-        x_cam = (u - _CX) * depth / _FX
-        y_cam = (v - _CY) * depth / _FY
+        pts = np.asarray([[u, v]], dtype=np.float32).reshape(-1, 1, 2)
+        undist = cv2.undistortPoints(pts, CAMERA_K, CAMERA_D, P=CAMERA_K)
+        u_corr = float(undist[0, 0, 0])
+        v_corr = float(undist[0, 0, 1])
+
+        fx = CAMERA_K[0, 0]
+        fy = CAMERA_K[1, 1]
+        cx = CAMERA_K[0, 2]
+        cy = CAMERA_K[1, 2]
+
+        x_cam = (u_corr - cx) * depth / fx
+        y_cam = (v_corr - cy) * depth / fy
         z_cam = depth
         return np.array([x_cam, y_cam, z_cam], dtype=np.float64)
 

@@ -246,6 +246,27 @@ class StageDRecorder:
                 if gain_schedule is not None:
                     f.attrs["gain_schedule"] = str(gain_schedule)
 
+                # Camera intrinsics regime — written on every saved episode
+                # so downstream training scripts can filter by calibration
+                # version (e.g., keep only the post-April-2026 calibrated
+                # set, exclude the URDF-approximation regime). Imported
+                # lazily so recorder.py keeps a minimal import surface for
+                # callers that don't load perception.
+                try:
+                    from src.perception.grounding import (
+                        CAMERA_K,
+                        CAMERA_D,
+                        CAMERA_INTRINSICS_VERSION,
+                    )
+                    f.attrs["camera_K"] = np.asarray(CAMERA_K, dtype=np.float64)
+                    f.attrs["camera_D"] = np.asarray(CAMERA_D, dtype=np.float64)
+                    f.attrs["camera_intrinsics_version"] = str(
+                        CAMERA_INTRINSICS_VERSION)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not stamp camera intrinsics into episode "
+                        f"metadata: {e}")
+
             logger.info(f"Wrote episode HDF5: {hdf5_path}  "
                         f"({len(self.timestamp)} steps, {len(g_log)} groundings, "
                         f"audio={'yes' if audio is not None else 'no'})")

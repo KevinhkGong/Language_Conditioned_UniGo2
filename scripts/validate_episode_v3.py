@@ -36,6 +36,13 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+# Allow running as `python scripts/validate_episode_v3.py …` by putting the
+# repo root on sys.path. Without this, the cross-script imports below resolve
+# only when the file is invoked as `python -m scripts.validate_episode_v3`.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # Reuse v2 (which reuses v2.1).
 from scripts.validate_episode_v2 import (
     validate_episode_v2,

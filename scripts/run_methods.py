@@ -158,6 +158,7 @@ CSV_FIELDS = [
     "rear_kd_used",
     "tau_scheme",
     "compliance_mode",
+    "stage_d_residual_scale",
 ]
 
 
@@ -197,6 +198,7 @@ class TrialOutcome:
     rear_kd_used: str = "n/a"
     tau_scheme: str = "n/a"
     compliance_mode: str = "n/a"
+    stage_d_residual_scale: str = "n/a"
 
 
 # ──────────────────────────────────────────────
@@ -401,6 +403,15 @@ def parse_args() -> argparse.Namespace:
              "baseline_2 (compliance is already off). Useful for isolating "
              "the FR Stage D residual contribution from compliance-induced "
              "body motion.",
+    )
+    p.add_argument(
+        "--residual-scale",
+        type=float,
+        default=1.0,
+        help="Multiply Stage D residual by this scalar before applying. "
+             "Default 1.0 (no scaling). Used for diagnostic at deployment to "
+             "test whether full-magnitude residual is destabilizing. Only "
+             "meaningful for core_method; ignored for baseline_1 and baseline_2.",
     )
     return p.parse_args()
 
@@ -668,6 +679,14 @@ def run_trial(
                     "rear_kp=%s rear_kd=%s",
                     args.rear_kp, args.rear_kd,
                 )
+            if args.residual_scale != 1.0:
+                controller_kwargs["stage_d_residual_scale"] = float(
+                    args.residual_scale)
+                logger.info(
+                    "Stage D residual scale active: residual multiplied by "
+                    "%.3f before adding to target_q.",
+                    args.residual_scale,
+                )
         else:
             if args.rear_kp is not None or args.rear_kd is not None:
                 logger.warning(
@@ -678,6 +697,11 @@ def run_trial(
                 logger.warning(
                     "--no-compliance is a no-op for variant %s (compliance is "
                     "already off in HeuristicContact base class).",
+                    args.variant,
+                )
+            if args.residual_scale != 1.0:
+                logger.warning(
+                    "--residual-scale ignored: variant %s does not use Stage D",
                     args.variant,
                 )
 
@@ -708,6 +732,11 @@ def run_trial(
         if hasattr(controller, "_compliance_active"):
             outcome.compliance_mode = (
                 "on" if bool(controller._compliance_active) else "off"
+            )
+        if hasattr(controller, "_stage_d_residual_scale"):
+            outcome.stage_d_residual_scale = (
+                f"{float(controller._stage_d_residual_scale):.3f}"
+                if variant_cfg["stage_d_ckpt"] is not None else "n/a"
             )
         if hasattr(controller, "_gravity_ff_enabled"):
             outcome.tau_scheme = (

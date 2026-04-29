@@ -61,20 +61,22 @@ PHASE_NAMES = {0: "lift", 1: "extend", 2: "hold"}
 
 @dataclass
 class TrainConfig:
-    data_dirs:      list[str]
-    format_filter:  str | None
-    epochs:         int
-    batch_size:     int
-    lr:             float
-    weight_decay:   float
-    joint_weights:  list[float]
-    val_fraction:   float
-    seed:           int
-    out_dir:        str
-    device:         str
-    log_every:      int
-    phases:         list[int]
-    no_save:        bool
+    data_dirs:                 list[str]
+    format_filter:             str | None
+    epochs:                    int
+    batch_size:                int
+    lr:                        float
+    weight_decay:              float
+    joint_weights:             list[float]
+    val_fraction:              float
+    seed:                      int
+    out_dir:                   str
+    device:                    str
+    log_every:                 int
+    phases:                    list[int]
+    no_save:                   bool
+    gain_schedule_filter:      str | None
+    intrinsics_version_filter: str | None
 
 
 def _parse_csv_paths(s: str) -> list[str]:
@@ -104,12 +106,32 @@ def parse_args() -> TrainConfig:
                    help="12 comma-separated non-negative floats.")
     p.add_argument("--val-fraction",  type=float, default=0.2)
     p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--out-dir",       default="models/stage_d")
+    # --output-dir is the canonical name; --out-dir kept as an alias for
+    # backwards compatibility.
+    p.add_argument("--out-dir", "--output-dir", dest="out_dir",
+                   default="models/stage_d",
+                   help="Where to save the checkpoint, config.json, and "
+                        "training_log.json. Created if it does not exist.")
     p.add_argument("--device",        default="auto")
     p.add_argument("--log-every",     type=int,   default=1)
     p.add_argument("--phases",        default="0,1,2",
                    help="Comma-separated phase ints to include.")
     p.add_argument("--no-save",       action="store_true")
+    p.add_argument(
+        "--gain-schedule-filter",
+        type=str,
+        default=None,
+        help="If set, only load episodes where root attr 'gain_schedule' "
+             "matches this exact string. Default: no filter.",
+    )
+    p.add_argument(
+        "--intrinsics-version-filter",
+        type=str,
+        default=None,
+        help="If set, only load episodes where root attr "
+             "'camera_intrinsics_version' matches this exact string. "
+             "Default: no filter.",
+    )
     a = p.parse_args()
 
     weights = _parse_csv_floats(a.joint_weights)
@@ -139,6 +161,8 @@ def parse_args() -> TrainConfig:
         log_every=a.log_every,
         phases=phases,
         no_save=a.no_save,
+        gain_schedule_filter=a.gain_schedule_filter,
+        intrinsics_version_filter=a.intrinsics_version_filter,
     )
 
 
@@ -358,11 +382,18 @@ def main() -> None:
 
     # Data ─────────────────────────────────────────────────────────────
     data_paths = [Path(p) for p in cfg.data_dirs]
+    if cfg.gain_schedule_filter is not None:
+        logger.info(f"gain_schedule_filter: {cfg.gain_schedule_filter!r}")
+    if cfg.intrinsics_version_filter is not None:
+        logger.info(
+            f"intrinsics_version_filter: {cfg.intrinsics_version_filter!r}")
     train_ds, val_ds = build_stage_d_datasets(
         data_paths,
         val_fraction=cfg.val_fraction,
         seed=cfg.seed,
         phases=tuple(cfg.phases),
+        gain_schedule_filter=cfg.gain_schedule_filter,
+        intrinsics_version_filter=cfg.intrinsics_version_filter,
         format_filter=cfg.format_filter,
     )
     train_ep_ids = _episode_ids(train_ds)

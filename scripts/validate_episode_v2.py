@@ -22,6 +22,12 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+# Allow running as `python scripts/validate_episode_v2.py …` (no scripts
+# package installed). Mirrors the path-insert in validate_episode_v3.py.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 # Reuse the v2.1 validator verbatim; its checks still apply to v2 files.
 from scripts.validate_episode import (
     validate_episode as validate_episode_v21,

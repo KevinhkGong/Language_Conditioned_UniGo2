@@ -50,6 +50,29 @@ def parse_args():
     p.add_argument("--val-fraction",   type=float, default=0.2)
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--device",         default="cpu")
+    p.add_argument(
+        "--gain-schedule-filter",
+        type=str,
+        default=None,
+        help="If set, only load episodes where root attr 'gain_schedule' "
+             "matches this exact string. Default: no filter.",
+    )
+    p.add_argument(
+        "--intrinsics-version-filter",
+        type=str,
+        default=None,
+        help="If set, only load episodes where root attr "
+             "'camera_intrinsics_version' matches this exact string. "
+             "Default: no filter.",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Where to write eval.json. If unset, writes to "
+             "<checkpoint_dir>/eval.json (existing behaviour). Created "
+             "if it does not exist.",
+    )
     return p.parse_args()
 
 
@@ -86,10 +109,17 @@ def main() -> None:
         data_paths = [Path(p.strip()) for p in args.data_dirs.split(",")
                       if p.strip()]
     logger.info(f"Data dirs: {[str(p) for p in data_paths]}")
+    if args.gain_schedule_filter is not None:
+        logger.info(f"gain_schedule_filter: {args.gain_schedule_filter!r}")
+    if args.intrinsics_version_filter is not None:
+        logger.info(
+            f"intrinsics_version_filter: {args.intrinsics_version_filter!r}")
     _, val_ds = build_stage_c_datasets(
         data_paths,
         val_fraction=args.val_fraction,
         seed=args.seed,
+        gain_schedule_filter=args.gain_schedule_filter,
+        intrinsics_version_filter=args.intrinsics_version_filter,
     )
     live_val_ids = [s.episode_id for s in val_ds.samples]
     logger.info(f"Reproduced val episodes: {live_val_ids}")
@@ -192,7 +222,12 @@ def main() -> None:
         print()
 
     # Save ────────────────────────────────────────────────────────────
-    eval_path = ckpt_dir / "eval.json"
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = ckpt_dir
+    eval_path = out_dir / "eval.json"
     eval_path.write_text(json.dumps({
         "val_samples":         len(val_ds),
         "standoff_labeled_n":  len(so_sq_errs),

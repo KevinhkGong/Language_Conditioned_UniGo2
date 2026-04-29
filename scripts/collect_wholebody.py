@@ -114,8 +114,8 @@ logger = logging.getLogger("collect_wholebody")
 
 PROMPT              = "red button"
 PRESS_OFFSET_X      = 0.593
-PRESS_OFFSET_Y      = -0.047
-NAV_EXTRA_FORWARD_M = 0.10
+PRESS_OFFSET_Y      = 0
+NAV_EXTRA_FORWARD_M = 0.15
 MIN_GROUNDING_CONF  = 0.5
 AUDIO_SAMPLE_RATE   = 16000
 AUDIO_CAPTURE_RATE  = 48000

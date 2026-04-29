@@ -182,6 +182,28 @@ WEIGHT_SHIFT_POS[6]  = STAND_POS[6]  + 0.15   # RR_hip outward
 WEIGHT_SHIFT_POS[4]  = STAND_POS[4]  - 0.10   # FL_thigh lower
 WEIGHT_SHIFT_POS[10] = STAND_POS[10] - 0.10   # RL_thigh lower
 
+# Alternate deep-squat support tripod posture aligned to Sport Mode's
+# handshake hold (median of 4 stable captures, capture 4 outlier excluded).
+# Only mechanically holdable when paired with feedforward gravity comp; at
+# tau=0 even kp=KP_STABLE was insufficient and the body sagged.
+#
+# Not the deployment default — Stage C waypoints were trained against the
+# original WEIGHT_SHIFT_POS, so deploying at the handshake posture changes
+# FR's reach geometry and would require recapturing Stage C. Useful for
+# posture-feasibility experiments via heuristic_contact.py --deep-pose
+# (which passes this constant as weight_shift_pos_override on the
+# controller). FR slot stays at STAND_POS — only the support tripod rotates.
+WEIGHT_SHIFT_POS_HANDSHAKE = list(STAND_POS)
+WEIGHT_SHIFT_POS_HANDSHAKE[3]  = -0.225   # FL_hip
+WEIGHT_SHIFT_POS_HANDSHAKE[4]  = +0.667   # FL_thigh
+WEIGHT_SHIFT_POS_HANDSHAKE[5]  = -1.048   # FL_calf
+WEIGHT_SHIFT_POS_HANDSHAKE[6]  = -0.281   # RR_hip
+WEIGHT_SHIFT_POS_HANDSHAKE[7]  = +0.965   # RR_thigh
+WEIGHT_SHIFT_POS_HANDSHAKE[8]  = -1.674   # RR_calf
+WEIGHT_SHIFT_POS_HANDSHAKE[9]  = -0.262   # RL_hip
+WEIGHT_SHIFT_POS_HANDSHAKE[10] = +1.079   # RL_thigh
+WEIGHT_SHIFT_POS_HANDSHAKE[11] = -1.948   # RL_calf
+
 # ── FR leg offsets — wall press ───────────────────────────────────────────────
 # Leg swings forward and out to reach a wall-mounted button.
 # Thigh goes strongly negative (paw-forward), calf stays near neutral.
@@ -355,9 +377,11 @@ class HeuristicContact:
         stage_d_phases: Optional[Set[str]] = None,
         grounding_getter: Optional[Callable[[], Optional[np.ndarray]]] = None,
         stage_d_residual_mask: Optional[np.ndarray] = None,
+        stage_d_residual_scale: float = 1.0,
         gravity_ff_enabled: bool = False,
         gravity_ff_body_mass: float = GO2_NOMINAL_MASS_KG,
         gravity_ff_phases: Optional[Set[str]] = None,
+        weight_shift_pos_override: Optional[list] = None,
     ):
         # ── Optional deployment hooks (Friday demo) ────────────────────────
         # When ``fr_waypoints`` is provided, the lift/extend/hold FR targets
@@ -385,6 +409,11 @@ class HeuristicContact:
             self._stage_d_residual_mask: Optional[np.ndarray] = mask
         else:
             self._stage_d_residual_mask = None
+        # Scalar multiplier applied to the residual *after* the mask. Used as
+        # a deployment diagnostic to test whether full-magnitude predictions
+        # are destabilizing the closed loop. 1.0 = unchanged, 0.5 = half,
+        # 0.0 = no residual. Default 1.0 preserves prior behavior.
+        self._stage_d_residual_scale: float = float(stage_d_residual_scale)
         # Dynamic gravity-comp FF. When True, _send_cmd applies an analytical
         # per-leg static torque (calf) plus an empirical thigh constant during
         # the configured phases (default {lift, extend, hold, retract_*}). FR
@@ -396,6 +425,20 @@ class HeuristicContact:
             set(gravity_ff_phases) if gravity_ff_phases is not None
             else set(GRAVITY_FF_DEFAULT_PHASES)
         )
+        # Per-instance support-tripod target. Defaults to the module-level
+        # WEIGHT_SHIFT_POS so existing call sites are unchanged. Override is
+        # used by heuristic_contact.py --deep-pose to test the handshake-
+        # tripod posture against dynamic gravity FF without affecting the
+        # deployment-aligned posture baked into Stage C waypoints.
+        if weight_shift_pos_override is not None:
+            override = list(weight_shift_pos_override)
+            if len(override) != 12:
+                raise ValueError(
+                    f"weight_shift_pos_override must have 12 entries, "
+                    f"got {len(override)}")
+            self._weight_shift_pos: list = override
+        else:
+            self._weight_shift_pos = list(WEIGHT_SHIFT_POS)
         # Cached "last valid" target_pos_base for Stage D state. Filled at
         # execute() entry from self._target_offset; refreshed each step from
         # ``grounding_getter`` when one is configured. Never NaN — Stage D
@@ -766,9 +809,9 @@ class HeuristicContact:
         elif self._phase == "weight_shift":
             alpha = min(self._phase_step / STEPS_WEIGHT_SHIFT, 1.0)
             for i in range(12):
-                target_q[i] = (1-alpha)*STAND_POS[i] + alpha*WEIGHT_SHIFT_POS[i]
+                target_q[i] = (1-alpha)*STAND_POS[i] + alpha*self._weight_shift_pos[i]
 
-            gate_ok = gate_passed(WEIGHT_SHIFT_POS, [3, 9, 6], threshold=0.15)
+            gate_ok = gate_passed(self._weight_shift_pos, [3, 9, 6], threshold=0.15)
             if should_advance(STEPS_WEIGHT_SHIFT, gate_ok):
                 logger.info("✓ weight_shift complete")
                 # (v2.0 spec): capture actual at gate-passed transition
@@ -784,9 +827,9 @@ class HeuristicContact:
             self._phase_progress = alpha
             target_q = list(self._weight_shift_end)
             fr_s = np.array([
-                WEIGHT_SHIFT_POS[FR_HIP],
-                WEIGHT_SHIFT_POS[FR_THIGH],
-                WEIGHT_SHIFT_POS[FR_CALF],
+                self._weight_shift_pos[FR_HIP],
+                self._weight_shift_pos[FR_THIGH],
+                self._weight_shift_pos[FR_CALF],
             ])
             if self._fr_waypoints is not None:
                 fr_l = np.asarray(
@@ -966,10 +1009,10 @@ class HeuristicContact:
             # Only move the thigh — calf stays tucked
             target_q[FR_THIGH] = (
                 (1-alpha) * self._retract_curl_end[FR_THIGH]
-                + alpha   * WEIGHT_SHIFT_POS[FR_THIGH]
+                + alpha   * self._weight_shift_pos[FR_THIGH]
             )
 
-            gate_ok = abs(actual[FR_THIGH] - WEIGHT_SHIFT_POS[FR_THIGH]) < GATE_THRESHOLD
+            gate_ok = abs(actual[FR_THIGH] - self._weight_shift_pos[FR_THIGH]) < GATE_THRESHOLD
             if should_advance(STEPS_RETRACT_ROTATE, gate_ok):
                 logger.info(f"✓ retract_rotate complete  FR_thigh={actual[FR_THIGH]:+.3f}")
                 # (v2.0 spec): capture actual at gate-passed transition
@@ -985,10 +1028,10 @@ class HeuristicContact:
             target_q = list(self._retract_rotate_end)
             target_q[FR_CALF] = (
                 (1-alpha) * self._retract_rotate_end[FR_CALF]
-                + alpha   * WEIGHT_SHIFT_POS[FR_CALF]
+                + alpha   * self._weight_shift_pos[FR_CALF]
             )
 
-            gate_ok = abs(actual[FR_CALF] - WEIGHT_SHIFT_POS[FR_CALF]) < GATE_THRESHOLD
+            gate_ok = abs(actual[FR_CALF] - self._weight_shift_pos[FR_CALF]) < GATE_THRESHOLD
             if should_advance(STEPS_RETRACT_EXTEND, gate_ok):
                 logger.info(f"✓ retract_extend complete  FR_calf={actual[FR_CALF]:+.3f}")
                 # (v2.0 spec): capture actual at gate-passed transition
@@ -1174,6 +1217,8 @@ class HeuristicContact:
 
         if self._stage_d_residual_mask is not None:
             residual = residual * self._stage_d_residual_mask
+        if self._stage_d_residual_scale != 1.0:
+            residual = residual * self._stage_d_residual_scale
 
         out = list(target_q)
         for i in range(12):
@@ -1388,6 +1433,15 @@ if __name__ == "__main__":
                         help="Body mass (kg) used to scale gravity FF torques. "
                              f"Default {GO2_NOMINAL_MASS_KG}; raise if rear "
                              f"still sags, lower if FF overshoots.")
+    parser.add_argument("--deep-pose",   action="store_true",
+                        help="Use the Sport-Mode-aligned deep-squat handshake "
+                             "tripod (WEIGHT_SHIFT_POS_HANDSHAKE) instead of "
+                             "the default near-standing posture. Requires "
+                             "--gravity-ff for stable hold (deep posture is "
+                             "not holdable at tau=0). Posture-feasibility "
+                             "experiment only; Stage C waypoints in "
+                             "run_methods.py would need recapture for "
+                             "deployment use.")
     parser.add_argument("--dry-run",     action="store_true")
     args = parser.parse_args()
 
@@ -1399,6 +1453,10 @@ if __name__ == "__main__":
     print(f"Target:     ({args.target_x}, {args.target_y}, {args.target_z})")
     print(f"Foot force: {'enabled (stub)' if args.foot_force else 'disabled'}")
     print(f"Gravity FF: {'ENABLED (mass={:.1f} kg)'.format(args.ff_body_mass) if args.gravity_ff else 'disabled'}")
+    print(f"Posture:    {'HANDSHAKE-DEEP (WEIGHT_SHIFT_POS_HANDSHAKE)' if args.deep_pose else 'standard (WEIGHT_SHIFT_POS)'}")
+    if args.deep_pose and not args.gravity_ff:
+        print("WARNING: --deep-pose without --gravity-ff is unstable. "
+              "Add --gravity-ff or expect rear sag.")
     print(f"Audio:      disabled (CLI does not wire a detector; pass via script)")
     print("\nPhases: sit_to_stand → weight_shift → lift → extend → "
           "hold → retract → weight_unshift → settle → lower_to_sit → done")
@@ -1418,6 +1476,9 @@ if __name__ == "__main__":
         args.interface,
         gravity_ff_enabled=args.gravity_ff,
         gravity_ff_body_mass=args.ff_body_mass,
+        weight_shift_pos_override=(
+            WEIGHT_SHIFT_POS_HANDSHAKE if args.deep_pose else None
+        ),
     )
     print("✓ Connected")
 
