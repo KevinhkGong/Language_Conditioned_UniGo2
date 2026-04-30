@@ -395,7 +395,42 @@ Why each flag:
 - `--no-compliance` — FR uses KP_FR=40 (not KP_FR_COMPLIANT=15) during press; matches deployment of a non-guided press.
 - `--residual-scale 0.5` — half-magnitude residual; full scale was visibly destabilising rear legs under battery droop.
 
-### 4.2 Chunked variant (when v6 chunked is validated)
+### 4.2 v6 chunked — head-to-head with v5 (intended fair comparison)
+
+The whole point of running v6 is comparing it against v5 with **every other flag identical**. The only differences from §4.1 are: add `--use-chunked`, `--chunked-checkpoint`, `--chunk-size`, `--ensemble-decay`. `--stage-d-ckpt` is ignored when `--use-chunked` is set; we leave it in for symmetry with the v5 command.
+
+#### 4.2.1 First-time validation run (NO fallback — fail loudly if anything is wrong)
+
+Use this exact command for the **first** v6 chunked attempt, since v6 has never actually run on hardware (§7.1, §8.7). Omitting `--fallback-checkpoint` makes a chunked-load failure abort the script instead of silently degrading to v5:
+
+```bash
+python scripts/run_methods.py \
+  --variant core_method \
+  --stage-c-ckpt-dir models/stage_c_v5 \
+  --stage-d-ckpt models/stage_d_v5/stage_d.pt \
+  --use-chunked \
+  --chunked-checkpoint models/stage_d_v6_chunked/stage_d.pt \
+  --chunk-size 25 \
+  --ensemble-decay 0.1 \
+  --stage-d-device cpu \
+  --gravity-ff \
+  --no-compliance \
+  --residual-scale 0.5 \
+  --mic-index 11 \
+  --notes "v6 chunked validation run — first hardware attempt"
+```
+
+Sanity-check the launch log: you must see
+
+```
+Loading StageDChunkedInference from models/stage_d_v6_chunked/stage_d.pt (chunk_size=25, decay=0.1) on device=cpu
+```
+
+and you must **NOT** see any line containing `failed to load` or `falling back to single-step`. If the chunked load fails here, the script will raise and exit — that's intentional, fix the failure before re-running. Recommended: run 3 trials at the known-good fixed button position before changing anything.
+
+#### 4.2.2 Comparison runs (with fallback, post-validation)
+
+Once §4.2.1 has produced clean trials, you can switch to the safer command with `--fallback-checkpoint` enabled. **Watch the WARNING line on every launch** — if it appears, you're collecting v5 data wearing a v6 label.
 
 ```bash
 python scripts/run_methods.py \
@@ -411,10 +446,25 @@ python scripts/run_methods.py \
   --gravity-ff \
   --no-compliance \
   --residual-scale 0.5 \
-  --mic-index 11
+  --mic-index 11 \
+  --notes "v6 chunked comparison run"
 ```
 
-Critical: **`--chunk-size` must equal the trained checkpoint's `chunk_size`** (currently 25 for `stage_d_v6_chunked`). Mismatch silently triggers fallback to single-step v5 — see §8.7.
+Critical: **`--chunk-size` must equal the trained checkpoint's `chunk_size`** (25 for `stage_d_v6_chunked`). Mismatch silently triggers fallback to single-step v5 — see §8.7. The safer alternative is to omit `--chunk-size` entirely; the loader auto-infers from the checkpoint metadata, which makes a mismatch impossible by construction:
+
+```bash
+# Auto-infer chunk_size — recommended
+... --use-chunked --chunked-checkpoint models/stage_d_v6_chunked/stage_d.pt \
+    --ensemble-decay 0.1 \
+    --fallback-checkpoint models/stage_d_v5/stage_d.pt ...
+```
+
+#### 4.2.3 Comparison protocol notes
+
+- Run v5 (§4.1) and v6 (§4.2.2) in **alternating blocks** at the same physical button position to control for battery state and lighting drift.
+- Aim for the same N trials per variant (e.g. 5 each, alternating, for a 10-trial paired comparison).
+- Verify operator hands are off the paw for both — `--no-compliance` is the correct gain regime for both runs.
+- Do not change `--residual-scale` between v5 and v6 in the same comparison block. (It defaults to 1.0 elsewhere; keep it 0.5 here so both share the deployment scaler that made v5 stable.)
 
 ### 4.3 Baseline_1 (heuristic standoff + hardcoded waypoints)
 
@@ -604,17 +654,27 @@ Under `models/`:
 | `stage_d_v5` | Stage D single-step | `[3,3,3,1,1,1,1,1,1,1,1,1]` | same | **Current deployment Stage D** (single-step) |
 | `stage_d_v5_51` | Stage D single-step | `[5,5,5,1,1,1,1,1,1,1,1,1]` | same | v5 retrained with 5/1 weights |
 | `stage_d_v5_uni` | Stage D single-step | `[1,1,1,1,1,1,1,1,1,1,1,1]` | same | v5 uniform-weight ablation |
-| `stage_d_v6_chunked` | Stage D **chunked**, K=25 | `[3,3,3,1,1,1,1,1,1,1,1,1]` | same | **Current chunked candidate** (validated offline; not deployment-validated as of 2026-04-30) |
+| `stage_d_v6_chunked` | Stage D **chunked**, K=25 | `[3,3,3,1,1,1,1,1,1,1,1,1]` | same | **Offline-strong, never deployment-validated.** See §7.1, §8.7 — the only attempted hardware run silently fell back to v5 single-step due to a chunk-size mismatch. As of 2026-04-30, no hardware trial has actually executed the chunked policy. |
 
 All are 50 epochs, batch 256, lr=1e-3, weight decay=1e-4, val_fraction=0.2 seed=42, on `data/real/stage_d_v3`.
 
-### 7.1 Recommended deployment
+### 7.1 Recommended deployment — and the v6 caveat
 
-For the Friday demo: `stage_c_v5` + `stage_d_v5` (single-step). `stage_d_v6_chunked` is a fallback if single-step shows control jitter that chunking would smooth — but verify with a smoke trial first; it has not been deployment-validated.
+For the Friday demo: `stage_c_v5` + `stage_d_v5` (single-step). v5 single-step is the only Stage D variant that has been **validated on hardware** during the 2026-04-29 session.
 
-### 7.2 Headline offline metrics
+**`stage_d_v6_chunked` has not actually run on the robot.** The one deployment attempt (2026-04-30 00:27 UTC, trial `20260430_002727_core_method`) used `--chunk-size 10` against a checkpoint trained at K=25; the loader raised `ValueError`, `StageDChunkedInference` caught it, and silently delegated every `predict()` to the `--fallback-checkpoint` (`models/stage_d_v5/stage_d.pt`). The trial **did execute end-to-end and recorded `core_method` in the CSV**, but the residual was emitted by single-step v5, not chunked v6. The temporal-ensembling code path was never exercised on hardware.
 
-`models/stage_d_v6_chunked/eval.json` reports per-joint val MSE (16906 val samples, 9 held-out episodes, K=25):
+Before relying on v6 chunked for the demo or any thesis claim:
+1. Run the exact command in **§4.2.1** (no `--fallback-checkpoint`, so any load failure aborts loudly).
+2. Confirm the absence of the WARNING line described in §8.7 — its absence is the only confirmation that the chunked path actually loaded.
+3. Run 3 smoke trials at the known-good button position with that command.
+4. Only after those pass, switch to **§4.2.2** (with fallback safety net) for paired v5-vs-v6 comparison runs (protocol in §4.2.3).
+
+### 7.2 Headline offline metrics — interpret with caution
+
+`models/stage_d_v6_chunked/eval.json` reports per-joint val MSE on 16906 val samples (9 held-out episodes), K=25. **These are offline-only.** The held-out episodes were drawn from the same gain-schedule + intrinsics regime as training, so the val set is in-distribution. Low MSE here does not validate either (a) closed-loop stability of the chunked ensemble at 500 Hz, or (b) generalisation to the deployment distribution (different battery state, different ambient lighting, body kinematics with operator hands off the paw). Until v6 has run on hardware, treat these numbers as a *necessary but not sufficient* signal.
+
+Per-joint val MSE:
 
 | Joint | val MSE |
 |---|---|
@@ -661,15 +721,19 @@ Empirically, Stage C v5's waypoint head exhibits near-zero spatial sensitivity: 
 
 The Go2's battery sags ~10–15% in voltage over a multi-hour session. With KP_FR=40 and full Stage D residual, the actuator hits its voltage-limited torque ceiling and fails to reach the press depth (visible as "FR foot stops 1–2 cm above the button"). Mitigations: `--residual-scale 0.5`, `--no-compliance` (stiffer FR), swap battery between blocks, log battery in CSV (recommended TODO).
 
-### 8.7 Silent fallback with mismatched chunk_size
+### 8.7 Silent fallback with mismatched chunk_size — **bit us on the only v6 attempt**
 
-`StageDChunkedInference` catches load failures and silently delegates to a fallback single-step model when `--fallback-checkpoint` is set. If the user passes `--chunk-size 10` against a checkpoint with K=25, the load raises `ValueError` and the runner falls back without aborting. The CSV row says `core_method` but the trial actually ran on the single-step model. Always check the WARNING line:
+`StageDChunkedInference` catches load failures and silently delegates to a fallback single-step model when `--fallback-checkpoint` is set. If the user passes `--chunk-size 10` against a checkpoint with K=25, the load raises `ValueError`, the runner catches it, and continues without aborting. The CSV row reads `core_method`, the operator sees the system run normally, but the residual is being emitted by the fallback single-step model — not the chunked policy.
+
+**This actually happened.** Trial `20260430_002727_core_method` was launched as a v6 chunked run with `--chunk-size 10 --chunked-checkpoint models/stage_d_v6_chunked/stage_d.pt --fallback-checkpoint models/stage_d_v5/stage_d.pt`. The chunked load raised `ValueError("requested chunk_size=10 does not match checkpoint chunk_size=25")`, the runner fell back, and the trial executed end-to-end on v5 single-step. The user only realised post-hoc by reading the WARNING line in the launch log:
 
 ```
 Chunked checkpoint at <path> failed to load (<reason>); falling back to single-step <fallback>.
 ```
 
-Recommended hardening: have `run_methods.py` log `is_fallback` after construction and refuse to start if a chunked variant unexpectedly fell back.
+**Implication:** as of 2026-04-30, **v6 chunked has never been validated on hardware.** The eval.json numbers are good (§7.2), but offline val MSE on a same-regime held-out split does not establish closed-loop stability or deployment-distribution generalisation. Re-running with `--chunk-size 25` (or omitting the flag — auto-inference is the safer default) is a precondition for any thesis claim about chunked-policy behaviour.
+
+Recommended hardening: have `run_methods.py` log `inference.is_fallback` after construction and either (a) refuse to start if a chunked variant unexpectedly fell back, or (b) write the fallback state to the CSV row so post-hoc analysis can filter out misattributed trials.
 
 ### 8.8 Demonstrator stochasticity
 
@@ -727,7 +791,7 @@ We considered porting Stage D to a full ACT-style architecture (encoder + transf
 1. **NAV_EXTRA_FORWARD_M sign mismatch** between `run_methods.py` (`-`) and `collect_wholebody.py` (`+`), with also-different `PRESS_OFFSET_X` (0.203 vs 0.593) and `PRESS_OFFSET_Y` (0.140 vs 0.0). Reconcile before any re-tune.
 2. **`CONTACT_MAX_STEPS=6000` (12 s) may be too long** in casual deployment but **too short** for chunked Stage D under battery droop, where press descent can be slow. Worth instrumenting per-trial press time.
 3. **Stage D was not trained on intentional press-depth motion.** Training data is hand-bound, so the residual learned is mostly stabilization, not active descent. Future work: collect with intentional press-depth variation.
-4. **`stage_d_v6_chunked` not validated at deployment** as of 2026-04-30. Run a smoke trial before relying on it for the demo.
+4. **`stage_d_v6_chunked` has never executed on hardware** (as of 2026-04-30). Offline eval is good (§7.2), but the only deployment attempt silently fell back to v5 single-step due to a chunk-size mismatch (§7.1, §8.7). Run a 3-trial smoke at the known-good button position with `--chunk-size 25` — and verify the absence of the fallback WARNING — before any thesis claim about chunked-policy behaviour.
 5. **Static `SUPPORT_GRAVITY_FF` table is dead code** (preserved as historical reference). Decide whether to delete or document.
 6. **Foot-force sensor threshold** uncalibrated. Disabled by default. Re-enable would require a new calibration session.
 7. **`data/real/stage_d_v5/`** is an empty directory. Either populate or delete.
