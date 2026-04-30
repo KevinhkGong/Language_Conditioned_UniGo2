@@ -676,7 +676,8 @@ Recommended hardening: have `run_methods.py` log `is_fallback` after constructio
 Hand-guided demos vary by ±cm on FR placement and ±deg on body posture between operators. Stage D's per-step residuals therefore include demonstrator noise as well as state-dependent corrections. With single-step inference the model can amplify this noise into 500 Hz jitter; chunked + temporal ensembling smooths it. (This is the main motivation for the chunked variant.)
 
 ### 8.9 Multi-session perception drift
-
+| **v4 / FF-stable** | (uncertain count) | 15 | 35 | ✓ | calib_2026_04 | (likely) `wholebody_v2_kpsupport35` | First collection where dynamic gravity FF carried the rear torque — KP_SUPPORT lowered because PD no longer needs to fight gravity; intrinsics calibrated for the first time |
+| **v5** | 24 added 2026-04-29 | 15 | 35 | ✓ | calib_2026_04 | `wholebody_v2_kpsupport35` | Same regime as v4 plus position diversity. Three blocks at button heights 0.43 m, 0.55 m, 0.50 m floor (TODO: verify; from `log` file). Recorded with the final HDF5 schema |
 Across the v3 collection sessions (~2 hours each), `standoff_x` drifted from ~0.55 m to ~0.50 m at the same physical button position. Likely cause: thermal or lighting shift in Depth Anything V2's prediction. Operators adapted by adjusting `NAV_EXTRA_FORWARD_M` — this contributed to the mode mixture in the v3 dataset (S, T, S- modes; see Summary 6 §3.5).
 
 ### 8.10 NAV_EXTRA_FORWARD_M sign mismatch
