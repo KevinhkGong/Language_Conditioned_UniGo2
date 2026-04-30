@@ -1,0 +1,37 @@
+{
+  "data_dirs": [
+    "data/real/stage_d_v3"
+  ],
+  "format_filter": null,
+  "epochs": 50,
+  "batch_size": 256,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "joint_weights": [
+    3.0,
+    3.0,
+    3.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "val_fraction": 0.2,
+  "seed": 42,
+  "out_dir": "models/stage_d_v5",
+  "device": "auto",
+  "log_every": 1,
+  "phases": [
+    0,
+    1,
+    2
+  ],
+  "no_save": false,
+  "gain_schedule_filter": "wholebody_v2_kpsupport35",
+  "intrinsics_version_filter": "calib_2026_04"
+}

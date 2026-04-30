@@ -35,7 +35,11 @@ from src.data.dataset import (
     STATE_LAYOUT,
     build_stage_d_datasets,
 )
-from src.models.stage_d import StageDBundle, STAGE_D_OUTPUT_DIM
+from src.models.stage_d import (
+    STAGE_D_OUTPUT_DIM,
+    StageDBundle,
+    StageDChunkedBundle,
+)
 
 logger = logging.getLogger("train_stage_d")
 
@@ -77,6 +81,7 @@ class TrainConfig:
     no_save:                   bool
     gain_schedule_filter:      str | None
     intrinsics_version_filter: str | None
+    chunk_size:                int
 
 
 def _parse_csv_paths(s: str) -> list[str]:
@@ -132,6 +137,16 @@ def parse_args() -> TrainConfig:
              "'camera_intrinsics_version' matches this exact string. "
              "Default: no filter.",
     )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1,
+        help="Action chunk size. 1 (default) trains the legacy single-step "
+             "MLP — bit-for-bit identical pre-change behaviour. >1 (e.g., 25 "
+             "for 50ms at 500Hz) trains the chunked StageDChunkedPolicy with "
+             "K future residuals; per-step joint weights are broadcast across "
+             "K. Boundary samples (t+K > episode T) are dropped.",
+    )
     a = p.parse_args()
 
     weights = _parse_csv_floats(a.joint_weights)
@@ -145,6 +160,10 @@ def parse_args() -> TrainConfig:
     phases = _parse_csv_ints(a.phases)
     if any(ph not in (0, 1, 2) for ph in phases):
         raise ValueError(f"--phases must be subset of {{0,1,2}}, got {phases}")
+
+    if a.chunk_size < 1:
+        raise ValueError(
+            f"--chunk-size must be >= 1, got {a.chunk_size}")
 
     return TrainConfig(
         data_dirs=_parse_csv_paths(a.data_dirs),
@@ -163,6 +182,7 @@ def parse_args() -> TrainConfig:
         no_save=a.no_save,
         gain_schedule_filter=a.gain_schedule_filter,
         intrinsics_version_filter=a.intrinsics_version_filter,
+        chunk_size=a.chunk_size,
     )
 
 
@@ -210,11 +230,23 @@ class NormalizedStageDDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────
 
 _TENSOR_KEYS = ("state", "delta_fr", "delta_q")
+_TENSOR_KEYS_CHUNKED = ("state", "delta_q_chunk")
 
 
 def stage_d_collate(batch: list[dict]) -> dict:
     out: dict = {}
     for k in _TENSOR_KEYS:
+        out[k] = torch.stack([b[k] for b in batch], dim=0)
+    out["phase"]               = torch.stack(
+        [b["phase"] for b in batch], dim=0)
+    out["episode_id"]          = [b["episode_id"] for b in batch]
+    out["data_format_version"] = [b["data_format_version"] for b in batch]
+    return out
+
+
+def stage_d_collate_chunked(batch: list[dict]) -> dict:
+    out: dict = {}
+    for k in _TENSOR_KEYS_CHUNKED:
         out[k] = torch.stack([b[k] for b in batch], dim=0)
     out["phase"]               = torch.stack(
         [b["phase"] for b in batch], dim=0)
@@ -232,6 +264,17 @@ def weighted_mse(pred: torch.Tensor, target: torch.Tensor,
     """``mean over batch of sum_j w_j * (pred_j - target_j)^2``."""
     sq = (pred - target) ** 2
     return (sq * weights).sum(dim=1).mean()
+
+
+def weighted_mse_chunk(pred: torch.Tensor, target: torch.Tensor,
+                        weights: torch.Tensor) -> torch.Tensor:
+    """Chunked variant: pred / target are (B, K, 12); weights (12,) broadcast.
+
+    Returns the mean over both batch and K of the per-step weighted joint
+    sum-of-squared-error. Reduces to ``weighted_mse`` when K=1.
+    """
+    sq = (pred - target) ** 2  # (B, K, 12)
+    return (sq * weights).sum(dim=-1).mean()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -303,6 +346,95 @@ def eval_epoch(
             if mask.any():
                 sqerr_phase_joint[ph_id] += sq[mask].sum(dim=0).double()
                 n_per_phase[ph_id] += int(mask.sum().item())
+
+    per_joint_mse = (sqerr_per_joint / max(1, n_total)).cpu().numpy().tolist()
+    per_phase_per_joint_mse = {
+        ph: (sqerr_phase_joint[ph] / max(1, n_per_phase[ph]))
+            .cpu().numpy().tolist()
+        for ph in (0, 1, 2)
+    }
+    return {
+        "weighted_loss":            loss_sum / max(1, n_batches),
+        "per_joint_mse":            per_joint_mse,
+        "per_phase_per_joint_mse":  per_phase_per_joint_mse,
+        "n_per_phase":              n_per_phase,
+        "n_total":                  n_total,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Chunked epoch loops (parallel to the single-step versions above)
+# ──────────────────────────────────────────────────────────────────────
+
+def train_epoch_chunked(
+    bundle: StageDChunkedBundle,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    weights: torch.Tensor,
+    device: torch.device,
+) -> dict:
+    bundle.train()
+    loss_sum = 0.0
+    n_batches = 0
+    for batch in loader:
+        x = batch["state"].to(device)              # (B, 33)
+        y = batch["delta_q_chunk"].to(device)      # (B, K, 12)
+        pred = bundle.policy(x)                    # (B, K, 12)
+        loss = weighted_mse_chunk(pred, y, weights)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        loss_sum += float(loss.item())
+        n_batches += 1
+    return {"weighted_loss": loss_sum / max(1, n_batches)}
+
+
+@torch.no_grad()
+def eval_epoch_chunked(
+    bundle: StageDChunkedBundle,
+    loader: DataLoader,
+    weights: torch.Tensor,
+    device: torch.device,
+) -> dict:
+    """Chunked-mode eval. ``per_joint_mse`` averages over batch and K.
+
+    Per-phase breakdown is keyed on the chunk's *start* phase; the body of
+    the chunk may span phase transitions.
+    """
+    bundle.eval()
+    loss_sum = 0.0
+    n_batches = 0
+
+    sqerr_per_joint = torch.zeros(
+        STAGE_D_OUTPUT_DIM, dtype=torch.float64, device=device)
+    n_total = 0  # total time-step labels seen across (B, K)
+
+    sqerr_phase_joint = {
+        ph: torch.zeros(STAGE_D_OUTPUT_DIM,
+                        dtype=torch.float64, device=device)
+        for ph in (0, 1, 2)
+    }
+    n_per_phase = {ph: 0 for ph in (0, 1, 2)}
+
+    for batch in loader:
+        x = batch["state"].to(device)              # (B, 33)
+        y = batch["delta_q_chunk"].to(device)      # (B, K, 12)
+        ph = batch["phase"].to(device)             # (B,)
+        pred = bundle.policy(x)                    # (B, K, 12)
+
+        loss = weighted_mse_chunk(pred, y, weights)
+        loss_sum += float(loss.item())
+        n_batches += 1
+
+        sq = (pred - y) ** 2                       # (B, K, 12)
+        sqerr_per_joint += sq.sum(dim=(0, 1)).double()
+        n_total += sq.shape[0] * sq.shape[1]
+
+        for ph_id in (0, 1, 2):
+            mask = ph == ph_id
+            if mask.any():
+                sqerr_phase_joint[ph_id] += sq[mask].sum(dim=(0, 1)).double()
+                n_per_phase[ph_id] += int(mask.sum().item()) * sq.shape[1]
 
     per_joint_mse = (sqerr_per_joint / max(1, n_total)).cpu().numpy().tolist()
     per_phase_per_joint_mse = {
@@ -395,7 +527,12 @@ def main() -> None:
         gain_schedule_filter=cfg.gain_schedule_filter,
         intrinsics_version_filter=cfg.intrinsics_version_filter,
         format_filter=cfg.format_filter,
+        chunk_size=cfg.chunk_size,
     )
+    chunked = cfg.chunk_size > 1
+    if chunked:
+        logger.info(
+            f"chunk_size={cfg.chunk_size} → training StageDChunkedPolicy.")
     train_ep_ids = _episode_ids(train_ds)
     val_ep_ids   = _episode_ids(val_ds)
     logger.info(
@@ -418,15 +555,24 @@ def main() -> None:
     train_norm = NormalizedStageDDataset(train_ds, normalizer)
     val_norm   = NormalizedStageDDataset(val_ds,   normalizer)
 
+    collate_fn = stage_d_collate_chunked if chunked else stage_d_collate
     train_loader = DataLoader(
         train_norm, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=0, collate_fn=stage_d_collate, drop_last=False)
+        num_workers=0, collate_fn=collate_fn, drop_last=False)
     val_loader = DataLoader(
         val_norm, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=0, collate_fn=stage_d_collate, drop_last=False)
+        num_workers=0, collate_fn=collate_fn, drop_last=False)
 
     # Model ────────────────────────────────────────────────────────────
-    bundle = StageDBundle.fresh(normalizer, weights_np).to(device)
+    if chunked:
+        bundle = StageDChunkedBundle.fresh(
+            normalizer, weights_np, cfg.chunk_size).to(device)
+        train_fn = train_epoch_chunked
+        eval_fn = eval_epoch_chunked
+    else:
+        bundle = StageDBundle.fresh(normalizer, weights_np).to(device)
+        train_fn = train_epoch
+        eval_fn = eval_epoch
     weights_t = bundle.joint_weights.to(device)
     logger.info(f"StageDPolicy params: {count_params(bundle.policy)}")
 
@@ -441,9 +587,9 @@ def main() -> None:
     t_start = time.time()
     for epoch in range(1, cfg.epochs + 1):
         ep_t0 = time.time()
-        train_stats = train_epoch(
+        train_stats = train_fn(
             bundle, train_loader, optimizer, weights_t, device)
-        val_stats   = eval_epoch(bundle, val_loader, weights_t, device)
+        val_stats   = eval_fn(bundle, val_loader, weights_t, device)
         ep_dt = time.time() - ep_t0
 
         if val_stats["weighted_loss"] < best_val:
@@ -518,6 +664,7 @@ def main() -> None:
         "val_episode_ids":   val_ep_ids,
         "best_val":          best_val,
         "best_epoch":        best_epoch,
+        "chunk_size":        int(cfg.chunk_size),
     }, ckpt_path)
     logger.info(f"Checkpoint → {ckpt_path}")
 

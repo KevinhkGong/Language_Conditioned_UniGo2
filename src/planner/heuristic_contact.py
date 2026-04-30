@@ -134,7 +134,7 @@ STEPS_LOWER_TO_SIT      = 1500   # 3.0s min
 GATE_TIMEOUT = 500   # 1.0s extra before forcing advance
 
 CONTACT_PROXIMITY_M = 0.06
-CONTACT_MAX_STEPS   = 1500
+CONTACT_MAX_STEPS   = 6000
 
 FR_HIP   = 0
 FR_THIGH = 1
@@ -382,6 +382,10 @@ class HeuristicContact:
         gravity_ff_body_mass: float = GO2_NOMINAL_MASS_KG,
         gravity_ff_phases: Optional[Set[str]] = None,
         weight_shift_pos_override: Optional[list] = None,
+        stage_c_for_tracking: Optional[Any] = None,
+        track_target_during_hold: bool = False,
+        track_target_mode: str = "stage_c",
+        track_target_relift_threshold: float = 0.0,
     ):
         # ── Optional deployment hooks (Friday demo) ────────────────────────
         # When ``fr_waypoints`` is provided, the lift/extend/hold FR targets
@@ -439,6 +443,29 @@ class HeuristicContact:
             self._weight_shift_pos: list = override
         else:
             self._weight_shift_pos = list(WEIGHT_SHIFT_POS)
+        # ── Closed-loop FR target tracking (opt-in for moving-target demos)
+        # When enabled and a Stage C inference handle is provided plus a
+        # grounding_getter, the controller re-predicts FR waypoints on each
+        # active-phase control step using the latest grounded button position
+        # and updates ``self._fr_waypoints`` (and ``_hold_pos`` mid-hold) in
+        # place. This lets FR chase a moving button without retraining
+        # Stage D — at the cost of one Stage C waypoint forward per step.
+        # Skipped silently if any required dependency is missing.
+        self._stage_c_for_tracking = stage_c_for_tracking
+        self._track_target_during_hold = bool(track_target_during_hold)
+        if track_target_mode not in ("stage_c", "jacobian"):
+            raise ValueError(
+                f"track_target_mode must be 'stage_c' or 'jacobian', "
+                f"got {track_target_mode!r}")
+        self._track_target_mode: str = track_target_mode
+        # Lateral (xy) Cartesian threshold above which a Jacobian tracking
+        # update during ``hold`` rewinds the phase machine to ``lift`` —
+        # producing a re-lift / re-extend / re-press sequence at the new
+        # target position. 0.0 disables (default), so tracking just drags
+        # the foot along the surface as before.
+        self._track_target_relift_threshold: float = float(
+            track_target_relift_threshold)
+        self._last_tracked_target: Optional[np.ndarray] = None
         # Cached "last valid" target_pos_base for Stage D state. Filled at
         # execute() entry from self._target_offset; refreshed each step from
         # ``grounding_getter`` when one is configured. Never NaN — Stage D
@@ -729,6 +756,13 @@ class HeuristicContact:
             return
 
         self._phase_step += 1
+
+        # Closed-loop FR target tracking — opt-in for moving-target demos.
+        # Updates self._fr_waypoints in place from the latest grounded
+        # target_pos_base via Stage C's waypoint head, so the lift/extend
+        # phase logic naturally picks up the new FR targets next step. Also
+        # patches _hold_pos mid-hold so FR chases the live button position.
+        self._maybe_track_moving_target()
 
         # Read current actual joint positions and IMU under lock
         with self._state_lock:
@@ -1167,6 +1201,19 @@ class HeuristicContact:
         input unchanged — the residual is skipped rather than poisoned with
         NaN, since Stage D was trained on continuous values only.
         """
+        # Reset the inference object's internal state at active-phase entry.
+        # The chunked variant uses a rolling chunk buffer that must be
+        # cleared between phases; the single-step variant has no reset()
+        # method and the hasattr check is a no-op for it.
+        if getattr(self, "_stage_d_last_phase", None) != self._phase:
+            if hasattr(self._stage_d, "reset"):
+                try:
+                    self._stage_d.reset()
+                except Exception as e:
+                    logger.warning(
+                        f"Stage D inference reset() raised: {e}")
+            self._stage_d_last_phase = self._phase
+
         # Refresh target_pos_base from the grounding thread when one is
         # configured. Keep the previous value if the call returns None.
         if self._grounding_getter is not None:
@@ -1262,6 +1309,225 @@ class HeuristicContact:
 
         self._low_cmd.crc = self._crc.Crc(self._low_cmd)
         self._pub.Write(self._low_cmd)
+
+    # Tracking-update threshold (how far the live target must have moved
+    # from the last applied update before we re-fire). Tuned to be well
+    # below human perturbation magnitude and well above grounding jitter.
+    _TRACK_DELTA_THRESHOLD_M = 5e-3   # 5 mm
+
+    # Per-update joint-space safety clamp for Jacobian tracking. Caps how
+    # far each FR joint can be nudged in a single tracking update, so a
+    # noisy grounding spike can't fling FR.
+    _TRACK_DELTA_Q_CLAMP_RAD = 0.1
+
+    def _maybe_track_moving_target(self) -> None:
+        """Refresh ``self._fr_waypoints`` from the latest grounded target.
+
+        Opt-in via ``track_target_during_hold=True`` on construction. No-op
+        unless every dependency is present and the current phase is
+        ``{"lift", "extend", "hold"}``. Dispatches between two modes:
+
+          * "stage_c": re-predict FR waypoints by passing the live target
+            through Stage C's waypoint head. Output magnitude is bounded
+            by Stage C's spatial sensitivity — for a model trained on a
+            single target position, this barely moves anything.
+          * "jacobian": compute Cartesian delta of the live target from
+            the last applied update, convert to joint-space delta via the
+            inverse Jacobian of the FR foot, apply directly to the FR
+            waypoints. No model dependency; geometric chase.
+
+        Skips when the live target has moved less than ``_TRACK_DELTA_THRESHOLD_M``
+        from the last applied update (anti-jitter).
+        """
+        if not self._track_target_during_hold:
+            return
+        if self._fr_waypoints is None or self._grounding_getter is None:
+            return
+        if self._phase not in ("lift", "extend", "hold"):
+            return
+
+        try:
+            fresh = self._grounding_getter()
+        except Exception as e:
+            logger.warning(f"target-tracking grounding_getter raised: {e}")
+            return
+        if fresh is None:
+            return
+        fresh_arr = np.asarray(fresh, dtype=np.float32)
+        if fresh_arr.shape != (3,) or np.isnan(fresh_arr).any():
+            return
+
+        last = self._last_tracked_target
+        if last is not None and float(
+                np.linalg.norm(fresh_arr - last)) < self._TRACK_DELTA_THRESHOLD_M:
+            return
+
+        if self._track_target_mode == "jacobian":
+            self._track_target_jacobian(fresh_arr, last)
+        else:
+            self._track_target_stage_c(fresh_arr)
+
+    def _track_target_stage_c(self, fresh_arr: np.ndarray) -> None:
+        """Re-predict FR waypoints via Stage C's waypoint head."""
+        if self._stage_c_for_tracking is None:
+            return
+        try:
+            new_wp = self._stage_c_for_tracking.predict_waypoints(
+                fresh_arr, interaction="press")
+        except Exception as e:
+            logger.warning(f"target-tracking Stage C predict raised: {e}")
+            return
+
+        self._fr_waypoints["lift"]   = np.asarray(new_wp["lift"],   dtype=np.float32)
+        self._fr_waypoints["extend"] = np.asarray(new_wp["extend"], dtype=np.float32)
+        self._fr_waypoints["press"]  = np.asarray(new_wp["press"],  dtype=np.float32)
+        if self._phase == "hold":
+            press_fr = self._fr_waypoints["press"]
+            self._hold_pos[FR_HIP]   = float(press_fr[0])
+            self._hold_pos[FR_THIGH] = float(press_fr[1])
+            self._hold_pos[FR_CALF]  = float(press_fr[2])
+        self._last_tracked_target = fresh_arr
+
+    def _track_target_jacobian(
+        self,
+        fresh_arr: np.ndarray,
+        last: Optional[np.ndarray],
+    ) -> None:
+        """Apply a Cartesian delta to FR waypoints via the inverse Jacobian.
+
+        First call (``last is None``) just caches the target without
+        applying any motion. Each subsequent firing computes the Cartesian
+        delta from the last applied target, maps it to joint space via the
+        FR-leg inverse Jacobian (linearised at the current ``press``
+        waypoint), clamps for safety, and adds the delta to all three FR
+        waypoints. ``_hold_pos`` is patched in-place during hold.
+        """
+        if last is None:
+            self._last_tracked_target = fresh_arr
+            return
+
+        delta_xyz = (fresh_arr - last).astype(np.float64)
+
+        # Linearise at the current press waypoint — that's what FR is being
+        # driven toward, and the joint update is for the same destination.
+        fr_q_press = np.asarray(self._fr_waypoints["press"], dtype=np.float64)
+        if fr_q_press.shape != (3,):
+            return
+        J_inv = self._fr_jacobian_inverse(fr_q_press)
+        if J_inv is None:
+            logger.debug("Jacobian tracking: singular pose, skipping update.")
+            return
+
+        delta_q = J_inv @ delta_xyz   # (3,)
+        # Per-update safety clamp. Single noisy grounding spike → bounded.
+        np.clip(delta_q,
+                -self._TRACK_DELTA_Q_CLAMP_RAD,
+                +self._TRACK_DELTA_Q_CLAMP_RAD,
+                out=delta_q)
+        delta_q_f32 = delta_q.astype(np.float32)
+
+        for key in ("lift", "extend", "press"):
+            self._fr_waypoints[key] = (
+                np.asarray(self._fr_waypoints[key], dtype=np.float32)
+                + delta_q_f32
+            )
+        if self._phase == "hold":
+            self._hold_pos[FR_HIP]   += float(delta_q[0])
+            self._hold_pos[FR_THIGH] += float(delta_q[1])
+            self._hold_pos[FR_CALF]  += float(delta_q[2])
+
+        self._last_tracked_target = fresh_arr
+
+        # Optional re-lift: if the lateral (xy) move while we're in hold and
+        # haven't yet detected contact exceeds the configured threshold,
+        # rewind the phase machine to "lift" so the foot pulls back up and
+        # comes back down at the new target instead of dragging.
+        if (self._track_target_relift_threshold > 0.0
+                and self._phase == "hold"
+                and self._contact_step < 0):
+            lateral = float(np.linalg.norm(delta_xyz[:2]))
+            if lateral >= self._track_target_relift_threshold:
+                self._rewind_hold_to_lift()
+
+    def _rewind_hold_to_lift(self) -> None:
+        """Rewind the phase machine from ``hold`` back to ``lift``.
+
+        Used by Jacobian tracking when the live target jumps far enough
+        laterally that dragging FR along the surface is the wrong response.
+        Snapshots the current FR joint pose into ``_weight_shift_pos`` so the
+        next ``lift`` step interpolates from where the foot actually is to
+        the (already-updated) lift waypoint. Resets the contact-detection
+        latch and the Stage D inference reset is triggered automatically by
+        the phase change.
+        """
+        if self._low_state is None:
+            return
+        with self._state_lock:
+            fr_q_actual = (
+                self._low_state.motor_state[FR_HIP].q,
+                self._low_state.motor_state[FR_THIGH].q,
+                self._low_state.motor_state[FR_CALF].q,
+            )
+        self._weight_shift_pos[FR_HIP]   = float(fr_q_actual[0])
+        self._weight_shift_pos[FR_THIGH] = float(fr_q_actual[1])
+        self._weight_shift_pos[FR_CALF]  = float(fr_q_actual[2])
+        self._phase         = "lift"
+        self._phase_step    = 0
+        self._contact_step  = -1
+        self._contact_method = "none"
+        if self._audio_detector is not None:
+            try:
+                self._audio_detector.sound_detected = False
+            except Exception:
+                pass
+        logger.info(
+            "Tracking re-lift: large lateral target shift in hold — "
+            "rewinding phase to lift at FR=%s",
+            tuple(round(x, 3) for x in fr_q_actual),
+        )
+
+    @staticmethod
+    def _fr_jacobian_inverse(fr_q: np.ndarray) -> Optional[np.ndarray]:
+        """Inverse Jacobian of FR foot Cartesian position w.r.t. joints.
+
+        Mirrors the simplified FK in :meth:`_estimate_fr_foot`:
+            x = HIP_X + L_T·sin(t) + L_C·sin(t+c)
+            y = HIP_Y + L_T·sin(h)
+            z = -L_T·cos(t) - L_C·cos(t+c)
+        Block-diagonal: y depends only on hip; (x, z) on (thigh, calf).
+        Returns a (3, 3) numpy array mapping ``(δx, δy, δz)`` to
+        ``(δhip, δthigh, δcalf)``, or ``None`` near a singularity.
+        """
+        L_T = 0.213
+        L_C = 0.213
+        h, t, c = float(fr_q[0]), float(fr_q[1]), float(fr_q[2])
+
+        cos_h = math.cos(h)
+        if abs(cos_h) < 1e-3:
+            return None
+        # δhip from δy
+        E = L_T * cos_h
+
+        sin_t  = math.sin(t)
+        cos_t  = math.cos(t)
+        sin_tc = math.sin(t + c)
+        cos_tc = math.cos(t + c)
+
+        A = L_T * cos_t + L_C * cos_tc
+        B = L_C * cos_tc
+        C = L_T * sin_t + L_C * sin_tc
+        D = L_C * sin_tc
+        det_xz = A * D - B * C   # algebraically L_T · L_C · sin(c)
+        if abs(det_xz) < 1e-3:
+            return None
+
+        J_inv = np.zeros((3, 3), dtype=np.float64)
+        J_inv[0, 1] = 1.0 / E              # δhip   ← δy
+        J_inv[1, 0] =  D / det_xz          # δthigh ← δx
+        J_inv[1, 2] = -B / det_xz          # δthigh ← δz
+        J_inv[2, 0] = -C / det_xz          # δcalf  ← δx
+        J_inv[2, 2] =  A / det_xz          # δcalf  ← δz
+        return J_inv
 
     def _maybe_apply_gravity_ff(self) -> None:
         """Patch motor_cmd[i].tau with dynamic static gravity-comp torques.

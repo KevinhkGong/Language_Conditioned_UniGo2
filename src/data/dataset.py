@@ -94,6 +94,22 @@ class StageDSample:
     data_format_version: str            # "v2" or "v3"
 
 
+@dataclass
+class StageDChunkedSample:
+    """One (state, action_chunk) pair for action-chunked Stage D training.
+
+    ``state_33d`` is the per-step state at the chunk's starting timestep.
+    ``action_chunk`` is the K consecutive ``achieved_delta_q`` rows starting
+    at that timestep — the per-step labels the chunked policy is trained
+    to regress against.
+    """
+    state_33d: np.ndarray               # (33,) input at t
+    action_chunk: np.ndarray            # (K, 12) labels for [t, t+K)
+    episode_id: str
+    phase: int                          # 0=lift, 1=extend, 2=hold at t
+    data_format_version: str
+
+
 # ──────────────────────────────────────────────────────────────────────
 # HDF5 helpers
 # ──────────────────────────────────────────────────────────────────────
@@ -477,6 +493,58 @@ def _iter_stage_d_from_episode(
         f"dropped_nan={dropped_nan}")
 
 
+def _iter_stage_d_chunked_from_episode(
+    ep: dict, phase_set: set[int], chunk_size: int,
+) -> Iterator[tuple[StageDChunkedSample, str]]:
+    """Yield (StageDChunkedSample, episode_id) for every valid chunk-start.
+
+    A chunk is emitted when:
+      - ``phase_label[t] in phase_set`` (the chunk *starts* in an active
+        phase; the body of the chunk may span phase transitions).
+      - All steps in ``[t, t + chunk_size)`` have valid achieved deltas
+        (no NaN in foot_to_target_error or achieved_delta_fr).
+      - ``t + chunk_size <= T`` — boundary samples are dropped, never padded.
+    """
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    ep_id = ep["episode_id"]
+    valid = ep["valid_mask"]
+    phase_labels = ep["phase_label"]
+    achieved_q = ep["achieved_delta_q"]
+    fmt_version = ep["data_format_version"]
+    T = ep["T"]
+    dropped_phase = 0
+    dropped_nan = 0
+    dropped_boundary = 0
+    last_start = T - chunk_size + 1
+    for t in range(max(0, last_start)):
+        ph = int(phase_labels[t])
+        if ph not in phase_set:
+            dropped_phase += 1
+            continue
+        # Whole chunk must be valid (non-NaN at every step).
+        if not bool(np.all(valid[t : t + chunk_size])):
+            dropped_nan += 1
+            continue
+        state = _build_state_33d(ep, t)
+        action_chunk = np.asarray(
+            achieved_q[t : t + chunk_size], dtype=np.float32)
+        sample = StageDChunkedSample(
+            state_33d=state,
+            action_chunk=action_chunk,
+            episode_id=ep_id,
+            phase=ph,
+            data_format_version=fmt_version,
+        )
+        yield sample, ep_id
+    # Steps that can't start a chunk because the episode ends too soon.
+    dropped_boundary = max(0, T) - max(0, last_start)
+    logger.debug(
+        f"Episode {ep_id}: T={T} chunk_size={chunk_size} → "
+        f"dropped_phase={dropped_phase} dropped_nan={dropped_nan} "
+        f"dropped_boundary={dropped_boundary}")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Torch datasets
 # ──────────────────────────────────────────────────────────────────────
@@ -509,24 +577,56 @@ class StageCDataset(Dataset):
 
 
 class StageDDataset(Dataset):
-    """Wraps a materialized list of StageDSample objects."""
+    """Wraps a materialized list of Stage D samples.
 
-    def __init__(self, samples: list[StageDSample]):
+    ``chunk_size`` defaults to 1 — the legacy single-step path. The samples
+    list is then expected to contain ``StageDSample`` objects and each
+    ``__getitem__`` returns a dict with per-step ``state``, ``delta_fr``,
+    ``delta_q``, ``phase``, ``episode_id``, ``data_format_version`` (the
+    same shape and keys produced before this change).
+
+    When ``chunk_size > 1``, the samples list is expected to contain
+    ``StageDChunkedSample`` objects and each ``__getitem__`` returns a
+    dict with ``state``, ``delta_q_chunk`` (shape ``(K, 12)``), ``phase``,
+    ``episode_id``, ``data_format_version``. This path is opt-in and the
+    legacy path is bit-for-bit unchanged when chunk_size=1.
+    """
+
+    def __init__(self, samples: list, chunk_size: int = 1):
         self.samples = samples
+        self.chunk_size = int(chunk_size)
+        if self.chunk_size < 1:
+            raise ValueError(
+                f"chunk_size must be >= 1, got {self.chunk_size}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
         s = self.samples[idx]
+        if self.chunk_size == 1:
+            # Legacy path — StageDSample. Identical to pre-change output.
+            return {
+                "state":               torch.from_numpy(
+                    s.state_33d.astype(np.float32)),
+                "delta_fr":            torch.from_numpy(
+                    s.achieved_delta_fr.astype(np.float32)),
+                "delta_q":             torch.from_numpy(
+                    s.achieved_delta_q.astype(np.float32)),
+                "episode_id":          s.episode_id,
+                "phase":               torch.as_tensor(
+                    s.phase, dtype=torch.long),
+                "data_format_version": s.data_format_version,
+            }
+        # Chunked path — StageDChunkedSample.
         return {
-            "state":               torch.from_numpy(s.state_33d.astype(np.float32)),
-            "delta_fr":            torch.from_numpy(
-                s.achieved_delta_fr.astype(np.float32)),
-            "delta_q":             torch.from_numpy(
-                s.achieved_delta_q.astype(np.float32)),
+            "state":               torch.from_numpy(
+                s.state_33d.astype(np.float32)),
+            "delta_q_chunk":       torch.from_numpy(
+                s.action_chunk.astype(np.float32)),
             "episode_id":          s.episode_id,
-            "phase":               torch.as_tensor(s.phase, dtype=torch.long),
+            "phase":               torch.as_tensor(
+                s.phase, dtype=torch.long),
             "data_format_version": s.data_format_version,
         }
 
@@ -634,6 +734,7 @@ def build_stage_d_datasets(
     format_filter: str | None = None,
     gain_schedule_filter: str | None = None,
     intrinsics_version_filter: str | None = None,
+    chunk_size: int = 1,
 ) -> tuple[StageDDataset, StageDDataset]:
     """Build Stage D train/val datasets from one or more episode dirs.
 
@@ -643,10 +744,17 @@ def build_stage_d_datasets(
     matches; ``None`` keeps all. ``gain_schedule_filter`` and
     ``intrinsics_version_filter`` are exact-string root-attr filters used
     to scope training to a single collection regime.
+
+    ``chunk_size`` defaults to 1 (legacy single-step). When >1, each
+    sample is a ``StageDChunkedSample`` with ``action_chunk`` of shape
+    ``(K, 12)``; chunks that would extend past the episode boundary are
+    dropped (not padded).
     """
     if format_filter is not None and format_filter not in ("v2", "v3"):
         raise ValueError(
             f"format_filter must be None, 'v2', or 'v3'; got {format_filter!r}")
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
 
     paths = _list_episode_paths_multi(episodes_dirs)
     train_paths, val_paths = split_episodes_train_val(
@@ -655,13 +763,18 @@ def build_stage_d_datasets(
         train_paths, phases, format_filter,
         gain_schedule_filter=gain_schedule_filter,
         intrinsics_version_filter=intrinsics_version_filter,
+        chunk_size=chunk_size,
     )
     val_samples = _collect_stage_d(
         val_paths, phases, format_filter,
         gain_schedule_filter=gain_schedule_filter,
         intrinsics_version_filter=intrinsics_version_filter,
+        chunk_size=chunk_size,
     )
-    return StageDDataset(train_samples), StageDDataset(val_samples)
+    return (
+        StageDDataset(train_samples, chunk_size=chunk_size),
+        StageDDataset(val_samples, chunk_size=chunk_size),
+    )
 
 
 def _collect_stage_c(
@@ -690,9 +803,18 @@ def _collect_stage_d(
     format_filter: str | None = None,
     gain_schedule_filter: str | None = None,
     intrinsics_version_filter: str | None = None,
-) -> list[StageDSample]:
+    chunk_size: int = 1,
+) -> list:
+    """Collect per-step or per-chunk samples for Stage D training.
+
+    For ``chunk_size == 1`` (default), returns a list of ``StageDSample``
+    — bit-for-bit identical to the pre-change behavior. For
+    ``chunk_size > 1``, returns a list of ``StageDChunkedSample``.
+    """
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
     phase_set = set(int(p) for p in phases)
-    out: list[StageDSample] = []
+    out: list = []
     for p in paths:
         ep = load_episode(p)
         if ep is None:
@@ -705,7 +827,12 @@ def _collect_stage_d(
             intrinsics_version_filter=intrinsics_version_filter,
         ):
             continue
-        for sample, _ in _iter_stage_d_from_episode(ep, phase_set):
+        if chunk_size == 1:
+            iterator = _iter_stage_d_from_episode(ep, phase_set)
+        else:
+            iterator = _iter_stage_d_chunked_from_episode(
+                ep, phase_set, chunk_size)
+        for sample, _ in iterator:
             out.append(sample)
     return out
 

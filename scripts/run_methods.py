@@ -54,7 +54,14 @@ from scipy.io import wavfile
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from src.robot.go2_interface import Go2Interface
-from src.perception.grounding import Go2Camera, VisualGrounder
+import cv2
+
+from src.perception import grounding as _grounding_module
+from src.perception.grounding import (
+    Go2Camera,
+    VisualGrounder,
+    _annotate as _grounding_annotate,
+)
 from src.planner.heuristic_contact import HeuristicContact
 from src.planner.heuristic_contact_wholebody import HeuristicContactWholeBody
 from src.data.audio_recorder import AudioRecorder
@@ -63,7 +70,7 @@ from src.data.color_detector import ColorDetector
 from src.data.grounding_thread import GroundingThread
 
 from src.policy.stage_c_runtime import StageCInference
-from src.policy.stage_d_runtime import StageDInference
+from src.policy.stage_d_runtime import StageDChunkedInference, StageDInference
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +166,9 @@ CSV_FIELDS = [
     "tau_scheme",
     "compliance_mode",
     "stage_d_residual_scale",
+    "contact_regrounding",
+    "stage_d_device",
+    "camera_intrinsics_version",
 ]
 
 
@@ -199,6 +209,9 @@ class TrialOutcome:
     tau_scheme: str = "n/a"
     compliance_mode: str = "n/a"
     stage_d_residual_scale: str = "n/a"
+    contact_regrounding: str = "n/a"
+    stage_d_device: str = "n/a"
+    camera_intrinsics_version: str = ""
 
 
 # ──────────────────────────────────────────────
@@ -231,6 +244,32 @@ def compute_heuristic_standoff(target_pos_base: np.ndarray) -> np.ndarray:
     return np.array([dx, dy, 0.0], dtype=np.float32)
 
 
+def _save_grounding_artifacts(
+    frame: np.ndarray,
+    result,
+    prompt: str,
+    save_stem: Path,
+) -> None:
+    """Write a raw + annotated JPG pair next to each successful grounding.
+
+    ``save_stem`` is a path *prefix* (no extension); the function appends
+    ``_raw.jpg`` and ``_annotated.jpg``. Demo-friendly visuals: the
+    annotated frame carries the SAM2 mask overlay, GroundingDINO bbox,
+    centroid dot, and a metadata strip (prompt, confidence, depth, base
+    coords) — same renderer the grounding CLI uses.
+    """
+    try:
+        save_stem.parent.mkdir(parents=True, exist_ok=True)
+        raw_path = save_stem.with_name(save_stem.name + "_raw.jpg")
+        cv2.imwrite(str(raw_path), frame)
+        if result is not None:
+            annotated = _grounding_annotate(frame, result, prompt)
+            ann_path = save_stem.with_name(save_stem.name + "_annotated.jpg")
+            cv2.imwrite(str(ann_path), annotated)
+    except Exception as e:
+        logger.warning(f"Failed to save grounding frame {save_stem}: {e}")
+
+
 def _try_ground(
     camera: Go2Camera,
     grounder: VisualGrounder,
@@ -238,8 +277,14 @@ def _try_ground(
     *,
     retries: int = GROUND_RETRY_MAX,
     min_conf: float = MIN_GROUNDING_CONF,
+    save_stem: Optional[Path] = None,
 ) -> Optional[np.ndarray]:
-    """Take up to ``retries`` frames, return first valid ``position_base``."""
+    """Take up to ``retries`` frames, return first valid ``position_base``.
+
+    When ``save_stem`` is provided, write the raw + annotated frames of
+    the *successful* grounding to ``<stem>_raw.jpg`` and
+    ``<stem>_annotated.jpg``. Failed attempts are not saved.
+    """
     for attempt in range(1, retries + 1):
         frame = camera.get_frame()
         if frame is None:
@@ -257,6 +302,8 @@ def _try_ground(
             )
             time.sleep(GROUND_RETRY_SLEEP)
             continue
+        if save_stem is not None:
+            _save_grounding_artifacts(frame, result, prompt, save_stem)
         return np.asarray(result.position_base, dtype=np.float32).copy()
     return None
 
@@ -268,12 +315,22 @@ def _classify_failure(
     color_detected: Optional[str],
     timeout_phase: Optional[str],
 ) -> str:
-    if success_fk and color_detected == EXPECTED_COLOR:
+    """Auto-classify a trial's failure mode.
+
+    A trial is "successful" (failure_mode == "") if any contact signal
+    fired (FK proximity OR live audio) AND Whisper transcribed the
+    expected color word. Earlier versions only counted FK as "real
+    success", which mis-labelled audio-driven presses as ``miss``; that
+    bug is fixed here.
+    """
+    contact_succ = bool(success_fk or audio_detected)
+    color_match = (color_detected == EXPECTED_COLOR)
+    color_other = bool(color_detected) and not color_match  # heard a non-red color word
+
+    if contact_succ and color_match:
         return ""
-    if audio_detected and color_detected and color_detected != EXPECTED_COLOR:
+    if audio_detected and color_other:
         return "wrong_color"
-    if success_fk and not audio_detected:
-        return "miss"
     if timeout_phase is not None:
         return "timeout"
     return "miss"
@@ -413,6 +470,125 @@ def parse_args() -> argparse.Namespace:
              "test whether full-magnitude residual is destabilizing. Only "
              "meaningful for core_method; ignored for baseline_1 and baseline_2.",
     )
+    p.add_argument(
+        "--no-contact-regrounding",
+        action="store_true",
+        help="Suppress the 5 Hz GroundingThread for core_method. Stage D's "
+             "foot_to_target_error input falls back to the cached standoff "
+             "target for the contact phase. Used for diagnostic — the "
+             "GroundingThread runs GPU-bound perception (GroundingDINO + "
+             "SAM2 + Depth Anything) that contends with Stage D's per-step "
+             "predict() on the same GPU and can starve the 500 Hz control "
+             "loop. Only meaningful for core_method; no-op otherwise.",
+    )
+    p.add_argument(
+        "--stage-d-device",
+        type=str,
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="Device for Stage D inference. Default 'cuda'. Use 'cpu' to free "
+             "the GPU for the contact-time GroundingThread (~1-2ms forward "
+             "pass on CPU; should fit within the 2ms control loop budget). "
+             "Only meaningful for variants that load Stage D (core_method); "
+             "no-op for baseline_1 and baseline_2.",
+    )
+    p.add_argument(
+        "--use-chunked",
+        action="store_true",
+        help="Use the chunked Stage D model with temporal ensembling instead "
+             "of the single-step MLP. Requires --chunked-checkpoint pointing "
+             "at a chunked-trained Stage D checkpoint. Only meaningful for "
+             "core_method.",
+    )
+    p.add_argument(
+        "--chunked-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a Stage D chunked checkpoint (produced by "
+             "train_stage_d.py --chunk-size > 1). Required if --use-chunked "
+             "is set.",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=25,
+        help="Chunk size K for the chunked Stage D model. Must match the "
+             "checkpoint's chunk_size. Default 25 (50 ms at 500 Hz).",
+    )
+    p.add_argument(
+        "--ensemble-decay",
+        type=float,
+        default=0.1,
+        help="Exponential decay rate m used to weight past chunks: "
+             "w_i = exp(-m * i) where i is steps since the chunk was emitted. "
+             "Larger m → faster forgetting. Default 0.1 (weights halve every "
+             "~7 steps).",
+    )
+    p.add_argument(
+        "--fallback-checkpoint",
+        type=str,
+        default=None,
+        help="Optional path to a single-step Stage D checkpoint. If set and "
+             "--use-chunked fails to load the chunked checkpoint, the runner "
+             "transparently falls back to the single-step inference. If "
+             "unset, a chunked-load failure is fatal.",
+    )
+    p.add_argument(
+        "--track-target-during-hold",
+        action="store_true",
+        help="Closed-loop FR target tracking. When set, the controller "
+             "updates the FR target in place during lift/extend/hold from "
+             "the latest grounded button position. Mode is selected by "
+             "--track-target-mode. Requires contact regrounding (i.e. "
+             "core_method); 'stage_c' mode also requires --stage-c-ckpt-dir. "
+             "Useful for moving-target demos where the button is perturbed "
+             "mid-contact.",
+    )
+    p.add_argument(
+        "--track-target-mode",
+        choices=["stage_c", "jacobian"],
+        default="stage_c",
+        help="Tracking mode for --track-target-during-hold. 'stage_c' "
+             "re-predicts FR waypoints via Stage C's waypoint head (limited "
+             "by the trained model's spatial sensitivity). 'jacobian' maps "
+             "the Cartesian target delta to FR joint-space deltas via the "
+             "analytical inverse Jacobian — geometric chase, no model "
+             "dependency. Default 'stage_c'.",
+    )
+    p.add_argument(
+        "--track-target-relift-threshold",
+        type=float,
+        default=0.0,
+        help="Lateral-move threshold (metres) above which a Jacobian "
+             "tracking update during 'hold' rewinds the phase machine back "
+             "to 'lift', producing a clean re-lift / re-extend / re-press "
+             "at the new target instead of dragging the foot along the "
+             "surface. Only fires before contact has been detected. "
+             "0.0 (default) disables. Typical: 0.03 (3 cm).",
+    )
+    p.add_argument(
+        "--no-save-grounding-frames",
+        action="store_true",
+        help="Disable saving raw + annotated JPG frames for each successful "
+             "grounding stage (initial / approach / standoff). When unset "
+             "(default), frames are written to "
+             "<output-dir>/grounding/<trial_id>_<stage>_{raw,annotated}.jpg "
+             "for use in demo visualisation.",
+    )
+    p.add_argument(
+        "--intrinsics",
+        type=str,
+        choices=sorted(_grounding_module.INTRINSICS_PROFILES.keys()),
+        default=_grounding_module.CAMERA_INTRINSICS_VERSION_CALIB,
+        help="Camera intrinsics profile applied to all grounding calls "
+             "(initial detection, approach re-grounding, contact-time "
+             "GroundingThread). Default 'calib_2026_04' (plumb_bob "
+             "calibration from April 2026). Use 'urdf_legacy' to run "
+             "v3-era Stage C/D models that were trained against URDF-"
+             "derived intrinsics with no distortion correction; otherwise "
+             "their target_pos_base / foot_to_target_error inputs will "
+             "be subtly OOD relative to training.",
+    )
     return p.parse_args()
 
 
@@ -424,10 +600,16 @@ def run_trial(
     args: argparse.Namespace,
     csv_path: Path,
     audio_dir: Path,
+    grounding_dir: Optional[Path] = None,
 ) -> TrialOutcome:
     variant_cfg = VARIANTS[args.variant]
     trial_id = f"{_now_stamp()}_{args.variant}"
     audio_path = audio_dir / f"{trial_id}.wav"
+    save_grounding = (grounding_dir is not None
+                      and not args.no_save_grounding_frames)
+    g_stem = (
+        (grounding_dir / trial_id) if save_grounding else None
+    )
 
     outcome = TrialOutcome(
         trial_id=trial_id,
@@ -437,6 +619,8 @@ def run_trial(
         audio_path=str(audio_path.relative_to(Path.cwd())) if audio_path.is_absolute()
                    else str(audio_path),
         git_sha=_git_short_sha(),
+        camera_intrinsics_version=str(
+            _grounding_module.CAMERA_INTRINSICS_VERSION),
     )
 
     # Resources that need an explicit teardown if we get past creation.
@@ -503,12 +687,49 @@ def run_trial(
                 )
                 outcome.stage_c_checkpoint = str(stage_c_ckpt)
 
-        stage_d: Optional[StageDInference] = None
+        stage_d: Optional[Any] = None
         if variant_cfg["stage_d_ckpt"] is not None:
-            stage_d_ckpt = Path(args.stage_d_ckpt)
-            logger.info(f"Loading StageDInference from {stage_d_ckpt}")
-            stage_d = StageDInference(ckpt_path=stage_d_ckpt)
-            outcome.stage_d_checkpoint = str(stage_d_ckpt)
+            if args.use_chunked:
+                if args.chunked_checkpoint is None:
+                    raise ValueError(
+                        "--use-chunked requires --chunked-checkpoint.")
+                chunked_ckpt = Path(args.chunked_checkpoint)
+                logger.info(
+                    f"Loading StageDChunkedInference from {chunked_ckpt} "
+                    f"(chunk_size={args.chunk_size}, "
+                    f"decay={args.ensemble_decay}) "
+                    f"on device={args.stage_d_device}")
+                stage_d = StageDChunkedInference(
+                    checkpoint_path=chunked_ckpt,
+                    chunk_size=args.chunk_size,
+                    decay_rate=args.ensemble_decay,
+                    device=args.stage_d_device,
+                    fallback_to_single_step=(
+                        args.fallback_checkpoint is not None),
+                    fallback_checkpoint_path=args.fallback_checkpoint,
+                )
+                outcome.stage_d_checkpoint = str(chunked_ckpt)
+            else:
+                stage_d_ckpt = Path(args.stage_d_ckpt)
+                logger.info(
+                    f"Loading StageDInference from {stage_d_ckpt} "
+                    f"on device={args.stage_d_device}")
+                stage_d = StageDInference(
+                    ckpt_path=stage_d_ckpt, device=args.stage_d_device)
+                outcome.stage_d_checkpoint = str(stage_d_ckpt)
+            outcome.stage_d_device = args.stage_d_device
+        else:
+            if args.stage_d_device != "cuda":
+                # Flag set but variant doesn't load Stage D — surface it.
+                logger.warning(
+                    "--stage-d-device ignored: variant %s does not use Stage D",
+                    args.variant,
+                )
+            if args.use_chunked:
+                logger.warning(
+                    "--use-chunked ignored: variant %s does not use Stage D",
+                    args.variant,
+                )
 
         # ── 4. Stand ────────────────────────────────────────────────────
         logger.info("Standing up")
@@ -517,7 +738,10 @@ def run_trial(
 
         # ── 5. Initial grounding (with retry) ───────────────────────────
         logger.info("Initial grounding")
-        target_initial = _try_ground(camera, grounder, args.prompt)
+        target_initial = _try_ground(
+            camera, grounder, args.prompt,
+            save_stem=(Path(f"{g_stem}_initial") if g_stem else None),
+        )
         if target_initial is None:
             logger.error("Initial grounding failed after retries — aborting trial")
             outcome.failure_mode = "no_detection"
@@ -560,7 +784,10 @@ def run_trial(
 
         if variant_cfg["approach_regrounding"]:
             logger.info("Approach re-grounding")
-            target_mid = _try_ground(camera, grounder, args.prompt)
+            target_mid = _try_ground(
+                camera, grounder, args.prompt,
+                save_stem=(Path(f"{g_stem}_approach") if g_stem else None),
+            )
             if target_mid is not None:
                 if use_stage_c_standoff:
                     standoff_offset_2 = stage_c.predict_standoff(
@@ -581,7 +808,10 @@ def run_trial(
                 logger.warning("Approach re-grounding failed — keeping shot 1")
 
         # ── 8. Final grounding for contact target ───────────────────────
-        target_at_standoff = _try_ground(camera, grounder, args.prompt)
+        target_at_standoff = _try_ground(
+            camera, grounder, args.prompt,
+            save_stem=(Path(f"{g_stem}_standoff") if g_stem else None),
+        )
         if target_at_standoff is None:
             logger.warning(
                 "Final grounding failed — falling back to initial target.")
@@ -613,8 +843,14 @@ def run_trial(
             )
 
         # ── 10. Optional contact-time grounding thread (5 Hz) ───────────
+        # The CLI flag --no-contact-regrounding suppresses the thread even
+        # when the variant config asks for it. Used to diagnose GPU contention
+        # between the 5 Hz perception pipeline and Stage D's per-step predict().
         grounding_getter = None
-        if variant_cfg["contact_regrounding"]:
+        contact_regrounding_active = (
+            variant_cfg["contact_regrounding"] and not args.no_contact_regrounding
+        )
+        if contact_regrounding_active:
             logger.info(
                 f"Starting GroundingThread @ {CONTACT_GROUNDING_HZ} Hz")
             grounding_thread = GroundingThread(
@@ -623,6 +859,20 @@ def run_trial(
             )
             grounding_thread.start()
             grounding_getter = grounding_thread.get_latest_position
+            outcome.contact_regrounding = "on"
+        elif (variant_cfg["contact_regrounding"]
+              and args.no_contact_regrounding):
+            logger.info(
+                "Contact-time GroundingThread SUPPRESSED (--no-contact-regrounding). "
+                "Stage D state will use cached standoff target during the "
+                "contact phase.")
+            outcome.contact_regrounding = "suppressed"
+        elif args.no_contact_regrounding:
+            logger.warning(
+                "--no-contact-regrounding ignored: variant %s does not start "
+                "a contact-time GroundingThread.",
+                args.variant,
+            )
 
         # ── 11. Build contact controller ────────────────────────────────
         controller_class: Type = variant_cfg["controller_class"]
@@ -667,6 +917,51 @@ def run_trial(
                 "Dynamic gravity-comp FF active: analytical calf + empirical "
                 "thigh applied to FL/RR/RL during lift/extend/hold/retract_*."
             )
+
+        # Closed-loop target tracking — opt-in moving-target demo behaviour.
+        # Both modes require contact-time regrounding for live target_pos_base
+        # updates. 'stage_c' mode additionally requires Stage C (for live
+        # waypoint re-prediction); 'jacobian' mode uses an analytical inverse
+        # Jacobian and has no model dependency.
+        if args.track_target_during_hold:
+            stage_c_ok = (stage_c is not None and use_stage_c_waypoints)
+            need_stage_c = (args.track_target_mode == "stage_c")
+            can_track = (
+                grounding_getter is not None
+                and (stage_c_ok if need_stage_c else True)
+            )
+            if can_track:
+                if stage_c_ok:
+                    controller_kwargs["stage_c_for_tracking"] = stage_c
+                controller_kwargs["track_target_during_hold"] = True
+                controller_kwargs["track_target_mode"] = args.track_target_mode
+                if args.track_target_mode == "jacobian":
+                    controller_kwargs["track_target_relift_threshold"] = (
+                        float(args.track_target_relift_threshold))
+                relift_msg = (
+                    f", relift_threshold={args.track_target_relift_threshold:.3f} m"
+                    if (args.track_target_mode == "jacobian"
+                        and args.track_target_relift_threshold > 0)
+                    else ""
+                )
+                logger.info(
+                    "Closed-loop target tracking active: mode=%s%s, "
+                    "FR target updated from grounded button position on "
+                    "every active-phase control step (5 mm move threshold).",
+                    args.track_target_mode, relift_msg,
+                )
+            else:
+                missing = []
+                if need_stage_c and not stage_c_ok:
+                    missing.append("Stage C waypoints")
+                if grounding_getter is None:
+                    missing.append("contact regrounding")
+                logger.warning(
+                    "--track-target-during-hold (mode=%s) ignored: missing "
+                    "%s for variant %s.",
+                    args.track_target_mode,
+                    " + ".join(missing), args.variant,
+                )
 
         if controller_class is HeuristicContactWholeBody:
             if args.rear_kp is not None:
@@ -861,8 +1156,17 @@ def main() -> int:
     )
     args = parse_args()
 
+    # Apply the chosen intrinsics profile BEFORE VisualGrounder is
+    # constructed inside run_trial. The grounder's _unproject reads
+    # CAMERA_K / CAMERA_D from src.perception.grounding at call time,
+    # so this swap takes effect for every subsequent grounding call.
+    _grounding_module.use_intrinsics(args.intrinsics)
+    logger.info(
+        f"Camera intrinsics profile: {_grounding_module.CAMERA_INTRINSICS_VERSION}")
+
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audio"
+    grounding_dir = output_dir / "grounding"
     invocation_stamp = _now_stamp()
     csv_path = output_dir / f"eval_{invocation_stamp}.csv"
 
@@ -874,11 +1178,15 @@ def main() -> int:
     logger.info(f"Audio dir:        {audio_dir}")
     logger.info(f"stage_c_ckpt_dir: {args.stage_c_ckpt_dir}")
     logger.info(f"stage_d_ckpt:     {args.stage_d_ckpt}")
+    logger.info(f"intrinsics:       {_grounding_module.CAMERA_INTRINSICS_VERSION}")
     logger.info(f"--stage-c-fallback={args.stage_c_fallback}  "
                 f"--waypoints-fallback={args.waypoints_fallback}")
     logger.info("=" * 72)
 
-    outcome = run_trial(args, csv_path=csv_path, audio_dir=audio_dir)
+    outcome = run_trial(
+        args, csv_path=csv_path, audio_dir=audio_dir,
+        grounding_dir=grounding_dir,
+    )
 
     print("\nTrial summary:")
     print(f"  trial_id            = {outcome.trial_id}")

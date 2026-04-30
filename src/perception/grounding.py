@@ -77,39 +77,88 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor  # noqa: E402
 
 # ── Camera intrinsics ────────────────────────────────────────────────────────
 #
-# Calibrated camera intrinsics (plumb_bob model, obtained April 2026).
-# Validated against tape-measured ground truth at 3 positions:
-# residual error ~2 cm laterally. Replaces the URDF-derived approximation
-# below (fx=fy=554.3, cx=960, cy=540, no distortion) which gave
-# ~12 cm error and ~2.37× lateral over-scaling for off-centre detections.
+# Two profiles are defined, swappable at runtime via use_intrinsics():
+#
+#   - "calib_2026_04"  Calibrated plumb_bob model from April 2026 (default).
+#                      Validated against tape-measured ground truth at 3
+#                      positions; residual ~2 cm laterally.
+#   - "urdf_legacy"    Pre-calibration approximation from the URDF (120°
+#                      HFOV pinhole, no distortion). ~12 cm lateral error
+#                      at off-centre detections, ~2.37× lateral over-scaling.
+#                      Kept available for running v3-era models that were
+#                      trained against this intrinsics distribution.
 #
 # CAMERA_D follows OpenCV's plumb_bob ordering: [k1, k2, p1, p2, k3].
-CAMERA_K = np.array([
-    [1310.77826,    0.     , 1018.71143],
-    [   0.     , 1320.25059,  637.37672],
-    [   0.     ,    0.     ,    1.     ],
-], dtype=np.float64)
-CAMERA_D = np.array(
-    [-0.415971, 0.158898, -0.015395, -0.008031, 0.000000],
-    dtype=np.float64,
-)
-
-# Calibration version tag — recorders / metadata writers can read this so
-# downstream analysis can identify episodes captured under each intrinsics
-# regime. Bump this string when CAMERA_K / CAMERA_D are re-calibrated.
-CAMERA_INTRINSICS_VERSION = "calib_2026_04"
 
 # Image dimensions — used by helpers that need full-frame size.
 _IMG_W, _IMG_H = 1920, 1080
 
-# ── Legacy URDF-derived approximation (HISTORICAL REFERENCE — DO NOT USE) ────
-# Preserved so analyses or notebooks that hard-coded these values can still
-# resolve them. The unprojection path now goes through CAMERA_K / CAMERA_D.
-_HFOV_DEG_LEGACY   = 120.0
+# ── Calibrated profile ──
+CAMERA_K_CALIB = np.array([
+    [1310.77826,    0.     , 1018.71143],
+    [   0.     , 1320.25059,  637.37672],
+    [   0.     ,    0.     ,    1.     ],
+], dtype=np.float64)
+CAMERA_D_CALIB = np.array(
+    [-0.415971, 0.158898, -0.015395, -0.008031, 0.000000],
+    dtype=np.float64,
+)
+CAMERA_INTRINSICS_VERSION_CALIB = "calib_2026_04"
+
+# ── URDF-legacy profile ──
+_HFOV_DEG_LEGACY = 120.0
 _FX_LEGACY = _FY_LEGACY = (_IMG_W / 2.0) / math.tan(
     math.radians(_HFOV_DEG_LEGACY / 2.0))   # ≈ 554.3
-_CX_LEGACY         = _IMG_W / 2.0   # 960.0
-_CY_LEGACY         = _IMG_H / 2.0   # 540.0
+_CX_LEGACY = _IMG_W / 2.0   # 960.0
+_CY_LEGACY = _IMG_H / 2.0   # 540.0
+CAMERA_K_URDF = np.array([
+    [_FX_LEGACY,         0.0, _CX_LEGACY],
+    [        0.0, _FY_LEGACY, _CY_LEGACY],
+    [        0.0,        0.0,        1.0],
+], dtype=np.float64)
+CAMERA_D_URDF = np.zeros(5, dtype=np.float64)   # no distortion
+CAMERA_INTRINSICS_VERSION_URDF = "urdf_legacy"
+
+# Active profile — mutable module-level globals consumed by VisualGrounder
+# unprojection and by recorder.py metadata stamping. Default = calibrated.
+CAMERA_K = CAMERA_K_CALIB.copy()
+CAMERA_D = CAMERA_D_CALIB.copy()
+CAMERA_INTRINSICS_VERSION = CAMERA_INTRINSICS_VERSION_CALIB
+
+INTRINSICS_PROFILES = {
+    CAMERA_INTRINSICS_VERSION_CALIB: (CAMERA_K_CALIB, CAMERA_D_CALIB),
+    CAMERA_INTRINSICS_VERSION_URDF:  (CAMERA_K_URDF,  CAMERA_D_URDF),
+}
+
+
+def use_intrinsics(mode: str) -> None:
+    """Swap the active camera intrinsics profile.
+
+    Mutates module-level ``CAMERA_K``, ``CAMERA_D``, and
+    ``CAMERA_INTRINSICS_VERSION``. Subsequent calls into
+    ``VisualGrounder._unproject`` (and any consumer that reads these
+    globals — including recorder.py's HDF5 metadata stamp) pick up the
+    new values immediately.
+
+    Choices:
+      - "calib_2026_04": calibrated plumb_bob (current default).
+      - "urdf_legacy":   URDF-derived 120° pinhole, no distortion. Use
+                         when running v3-era models trained before camera
+                         calibration; their ``target_pos_base`` /
+                         ``foot_to_target_error`` inputs were learned on
+                         this distribution.
+
+    Raises ValueError on an unknown mode.
+    """
+    global CAMERA_K, CAMERA_D, CAMERA_INTRINSICS_VERSION
+    if mode not in INTRINSICS_PROFILES:
+        raise ValueError(
+            f"Unknown intrinsics mode {mode!r}. "
+            f"Choices: {sorted(INTRINSICS_PROFILES)}")
+    K, D = INTRINSICS_PROFILES[mode]
+    CAMERA_K = K.copy()
+    CAMERA_D = D.copy()
+    CAMERA_INTRINSICS_VERSION = mode
 
 # URDF-derived extrinsics — camera in robot base frame
 _CAM_FORWARD  =  0.327   # m

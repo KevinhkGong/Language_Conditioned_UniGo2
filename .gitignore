@@ -14,6 +14,7 @@ data/real/*
 *.pth
 *.ckpt
 old_models/
+data/eval/
 
 # Environment
 .env
