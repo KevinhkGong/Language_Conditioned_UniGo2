@@ -134,7 +134,7 @@ STEPS_LOWER_TO_SIT      = 1500   # 3.0s min
 GATE_TIMEOUT = 500   # 1.0s extra before forcing advance
 
 CONTACT_PROXIMITY_M = 0.06
-CONTACT_MAX_STEPS   = 6000
+CONTACT_MAX_STEPS   = 1500
 
 FR_HIP   = 0
 FR_THIGH = 1

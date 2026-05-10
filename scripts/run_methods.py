@@ -83,9 +83,9 @@ DEFAULT_INTERFACE = "enx98fc84e68f1a"
 DEFAULT_PROMPT    = "press the red button"
 DEFAULT_OUTPUT    = "data/eval"
 
-# Wall-press standoff geometry (training_data_spec.md / Summary 4).
-PRESS_OFFSET_X      = 0.203
-PRESS_OFFSET_Y      = 0.140
+# Wall-press standoff geometry collect wholebody
+PRESS_OFFSET_X      = 0.593
+PRESS_OFFSET_Y      = 0
 NAV_EXTRA_FORWARD_M = 0.15
 
 # Audio.
@@ -239,7 +239,7 @@ def compute_heuristic_standoff(target_pos_base: np.ndarray) -> np.ndarray:
     Returns an (3,) ``[dx, dy, dyaw]`` offset suitable for
     ``Go2Interface.move_to_position``.
     """
-    dx = float(target_pos_base[0]) - PRESS_OFFSET_X - NAV_EXTRA_FORWARD_M
+    dx = float(target_pos_base[0]) - PRESS_OFFSET_X 
     dy = float(target_pos_base[1]) - PRESS_OFFSET_Y
     return np.array([dx, dy, 0.0], dtype=np.float32)
 

@@ -14,3 +14,19 @@ Block 2 (0.55m floor): 4 eps, 4/4 audio-detected, Y/4 red,
 
 Block 3 (0.50m floor): 4 eps, X/4 audio-detected, Y/4 red,
   drag pattern: small forward and up
+
+
+
+
+Experiment: 
+Chunk
+M, M, S, S, M, S, S, S, S, S 7/10
+
+MLP 
+M, M, S, S, S, S, M, S, S, S 7/10
+
+Stage C only
+S, S, M, M, M, S, S, M, M, M 4/10
+
+Baseline 1
+M, S, M, M, M, S, S, 
