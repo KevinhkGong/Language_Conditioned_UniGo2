@@ -98,7 +98,7 @@ def _parse_csv_ints(s: str) -> list[int]:
 
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dirs",     default="data/real/stage_d_v2",
+    p.add_argument("--data-dirs",     default="data/real/stage_d_v3",
                    help="Comma-separated episode directories.")
     p.add_argument("--format-filter", default=None,
                    choices=[None, "v2", "v3"])
@@ -107,7 +107,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--lr",            type=float, default=1e-3)
     p.add_argument("--weight-decay",  type=float, default=1e-4)
     p.add_argument("--joint-weights",
-                   default="5,5,5,0,0,0,0,0,0,0,0,0",
+                   default="3,3,3,1,1,1,1,1,1,1,1,1",
                    help="12 comma-separated non-negative floats.")
     p.add_argument("--val-fraction",  type=float, default=0.2)
     p.add_argument("--seed",          type=int,   default=42)
