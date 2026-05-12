@@ -3,7 +3,7 @@
 A four-stage system that lets a Unitree Go2X press a spoken-or-typed-language-specified button on a wall using only its built-in monocular RGB camera — no depth sensor, no external motion capture.
 
 <p align="center">
-  <img src="figures/paper_images/press_robot.png" alt="Go2X pressing a button on a wall panel" width="640"/>
+  <img src="figures/banner.gif" alt="Go2X pressing a button on a wall panel" width="720"/>
 </p>
 
 ## Abstract
