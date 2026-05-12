@@ -134,21 +134,26 @@ With the robot powered on, in Sport Mode, and the link up:
 ```bash
 conda activate env_go2
 
-# Full pipeline (Stage A -> B -> C -> D + contact regrounding)
-# Defaults already point at the paper checkpoints; the flags below are shown explicitly:
+# Full pipeline, paper configuration (Stage A -> B -> C -> D + contact regrounding).
+# All paper-config flags (gravity FF on, compliance off, residual scale 0.5,
+# Stage D on CPU) are already defaults in run_methods.py — just pick a variant
+# and a mic index:
 python scripts/run_methods.py \
     --variant core_method \
     --prompt "press the red button" \
-    --interface enx98fc84e68f1a \
-    --stage-c-ckpt-dir models/stage_c_v5 \
-    --stage-d-ckpt models/stage_d_v5/stage_d.pt \
-    --output-dir data/eval \
-    --mic-index 6 \
-    --use-chunked \
-    --chunked-checkpoint models/stage_d_v6_chunked/stage_d.pt
+    --mic-index 11
 ```
 
-Drop `--use-chunked --chunked-checkpoint ...` to use the single-step Stage D model (`stage_d_v5`) instead of the temporal-ensembled chunked one (`stage_d_v6_chunked`).
+This runs the single-step Stage D model (`models/stage_d_v5/stage_d.pt`). To use the chunked Stage D model with temporal ensembling instead, add `--use-chunked --chunked-checkpoint models/stage_d_v6_chunked/stage_d.pt`.
+
+Common opt-outs (each undoes one paper-config default):
+
+```bash
+--no-gravity-ff           # disable dynamic gravity-comp feedforward
+--compliance              # re-enable soft FR + soft support gains during contact
+--residual-scale 1.0      # apply Stage D residual at full magnitude
+--stage-d-device cuda     # keep Stage D inference on the GPU
+```
 
 This runs **one trial** — Stage A parses the prompt, Stage B grounds the target, Stage C produces a standoff pose and FR waypoints, the robot walks to the standoff, then the contact phase runs Stage D residual control at 500 Hz with the GroundingThread regrounding at 5 Hz. A CSV row goes to `data/eval/` and the audio capture to `data/eval/audio/`.
 

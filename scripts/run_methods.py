@@ -444,31 +444,35 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--gravity-ff",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Apply dynamic gravity-compensation feedforward torque to support "
              "legs (FL, RR, RL) during the weight-bearing tripod phases "
-             "(lift, extend, hold, retract_*). Implemented in the base "
+             "(lift, extend, hold, retract_*). On by default (paper config); "
+             "pass --no-gravity-ff to disable. Implemented in the base "
              "HeuristicContact class so it's available for every variant.",
     )
     p.add_argument(
-        "--no-compliance",
-        action="store_true",
-        help="Disable compliance mode on core_method: FR uses KP_FR=40 and "
-             "support legs use KP_STABLE=100 during extend+hold (matches "
-             "baseline_2's gain regime). Stage C waypoints, Stage D residual, "
-             "and contact regrounding remain active. No effect on baseline_1/"
-             "baseline_2 (compliance is already off). Useful for isolating "
-             "the FR Stage D residual contribution from compliance-induced "
-             "body motion.",
+        "--compliance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable compliance mode on core_method (FR uses soft KP_FR_COMPLIANT "
+             "and support legs use soft KP_SUPPORT_SOFT during extend+hold). "
+             "OFF by default (paper config: --no-compliance was used so FR uses "
+             "KP_FR=40 and support legs use KP_STABLE=100 — matches baseline_2's "
+             "gain regime). Pass --compliance to re-enable. Stage C waypoints, "
+             "Stage D residual, and contact regrounding remain active regardless. "
+             "No effect on baseline_1/baseline_2 (compliance is structurally off).",
     )
     p.add_argument(
         "--residual-scale",
         type=float,
-        default=1.0,
+        default=0.5,
         help="Multiply Stage D residual by this scalar before applying. "
-             "Default 1.0 (no scaling). Used for diagnostic at deployment to "
-             "test whether full-magnitude residual is destabilizing. Only "
-             "meaningful for core_method; ignored for baseline_1 and baseline_2.",
+             "Default 0.5 (paper config — full-magnitude residual was found to "
+             "be destabilizing on hardware). Set to 1.0 to apply the unscaled "
+             "residual. Only meaningful for core_method; ignored for "
+             "baseline_1 and baseline_2.",
     )
     p.add_argument(
         "--no-contact-regrounding",
@@ -485,12 +489,13 @@ def parse_args() -> argparse.Namespace:
         "--stage-d-device",
         type=str,
         choices=["cuda", "cpu"],
-        default="cuda",
-        help="Device for Stage D inference. Default 'cuda'. Use 'cpu' to free "
-             "the GPU for the contact-time GroundingThread (~1-2ms forward "
-             "pass on CPU; should fit within the 2ms control loop budget). "
-             "Only meaningful for variants that load Stage D (core_method); "
-             "no-op for baseline_1 and baseline_2.",
+        default="cpu",
+        help="Device for Stage D inference. Default 'cpu' (paper config — frees "
+             "the GPU for the contact-time GroundingThread, which runs "
+             "GroundingDINO + SAM2 + Depth Anything; CPU forward pass is "
+             "~1-2 ms, well within the 2 ms 500-Hz control budget). Pass "
+             "'cuda' to keep Stage D on the GPU. Only meaningful for variants "
+             "that load Stage D (core_method); no-op for baseline_1 and baseline_2.",
     )
     p.add_argument(
         "--use-chunked",
@@ -907,16 +912,17 @@ def run_trial(
             stage_d_residual_mask=residual_mask,
         )
 
-        # Dynamic gravity-comp FF is now implemented in HeuristicContact
-        # (the base class), so it works for every variant. Pass the flag
-        # through unconditionally; the controller honours it during the
-        # default tripod-bearing phases.
+        # Dynamic gravity-comp FF is implemented in HeuristicContact (the base
+        # class), so it works for every variant. On by default (paper config);
+        # disable with --no-gravity-ff.
+        controller_kwargs["gravity_ff_enabled"] = bool(args.gravity_ff)
         if args.gravity_ff:
-            controller_kwargs["gravity_ff_enabled"] = True
             logger.info(
                 "Dynamic gravity-comp FF active: analytical calf + empirical "
                 "thigh applied to FL/RR/RL during lift/extend/hold/retract_*."
             )
+        else:
+            logger.info("Dynamic gravity-comp FF disabled (--no-gravity-ff).")
 
         # Closed-loop target tracking — opt-in moving-target demo behaviour.
         # Both modes require contact-time regrounding for live target_pos_base
@@ -974,27 +980,25 @@ def run_trial(
                     "rear_kp=%s rear_kd=%s",
                     args.rear_kp, args.rear_kd,
                 )
-            if args.residual_scale != 1.0:
-                controller_kwargs["stage_d_residual_scale"] = float(
-                    args.residual_scale)
-                logger.info(
-                    "Stage D residual scale active: residual multiplied by "
-                    "%.3f before adding to target_q.",
-                    args.residual_scale,
-                )
+            controller_kwargs["stage_d_residual_scale"] = float(args.residual_scale)
+            logger.info(
+                "Stage D residual scale: residual multiplied by %.3f before "
+                "adding to target_q (paper default 0.5).",
+                args.residual_scale,
+            )
         else:
             if args.rear_kp is not None or args.rear_kd is not None:
                 logger.warning(
                     "--rear-kp / --rear-kd ignored: variant %s does not use soft gains",
                     args.variant,
                 )
-            if args.no_compliance:
+            if args.compliance:
                 logger.warning(
-                    "--no-compliance is a no-op for variant %s (compliance is "
+                    "--compliance is a no-op for variant %s (compliance is "
                     "already off in HeuristicContact base class).",
                     args.variant,
                 )
-            if args.residual_scale != 1.0:
+            if args.residual_scale != 0.5:
                 logger.warning(
                     "--residual-scale ignored: variant %s does not use Stage D",
                     args.variant,
@@ -1002,14 +1006,14 @@ def run_trial(
 
         controller = controller_class(**controller_kwargs)
 
-        # ── Optional: disable compliance on the WholeBody controller ────
-        # When True, FR uses KP_FR_COMPLIANT=15 and support legs use
-        # self._kp_support_soft during extend+hold. Flipping the flag to
-        # False sends both branches to the stiff `else` clause:
-        # FR=KP_FR=40, support=KP_STABLE=100 — the same regime baseline_2
-        # uses, while keeping Stage D residual + grounding thread + Stage C
+        # ── Compliance mode on the WholeBody controller ─────────────────
+        # OFF by default (paper config). When compliance is on, FR uses
+        # KP_FR_COMPLIANT=15 and support legs use self._kp_support_soft during
+        # extend+hold. When off, both branches fall through to the stiff
+        # regime (FR=KP_FR=40, support=KP_STABLE=100 — same as baseline_2),
+        # while keeping Stage D residual + grounding thread + Stage C
         # waypoints intact for FR-only correction studies.
-        if (args.no_compliance
+        if (not args.compliance
                 and controller_class is HeuristicContactWholeBody
                 and hasattr(controller, "_compliance_active")):
             controller._compliance_active = False
