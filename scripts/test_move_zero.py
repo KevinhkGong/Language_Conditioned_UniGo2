@@ -20,4 +20,3 @@ go2.move(vx=-0.1, vy=-0.01, vyaw=0.0, duration=5.0)
 print("Stopped. Observe final pose.")
 input("Press Enter to sit")
 go2.sit()
-go2.__getstate__

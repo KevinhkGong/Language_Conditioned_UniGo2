@@ -19,8 +19,8 @@ CLI:
         --variant {baseline_1,baseline_2,core_method} \\
         --prompt "press the red button" \\
         --interface enx98fc84e68f1a \\
-        --stage-c-ckpt-dir models/stage_c \\
-        --stage-d-ckpt models/stage_d_combined/stage_d.pt \\
+        --stage-c-ckpt-dir models/stage_c_v5 \\
+        --stage-d-ckpt models/stage_d_v5/stage_d.pt \\
         --output-dir data/eval \\
         --mic-index 6 \\
         [--stage-c-fallback] [--waypoints-fallback] [--notes "..."]
@@ -402,9 +402,9 @@ def parse_args() -> argparse.Namespace:
                    help="Language prompt for visual grounding.")
     p.add_argument("--interface", default=DEFAULT_INTERFACE,
                    help="DDS Ethernet interface name.")
-    p.add_argument("--stage-c-ckpt-dir", default="models/stage_c",
+    p.add_argument("--stage-c-ckpt-dir", default="models/stage_c_v5",
                    help="Directory containing stage_c.pt.")
-    p.add_argument("--stage-d-ckpt", default="models/stage_d_combined/stage_d.pt",
+    p.add_argument("--stage-d-ckpt", default="models/stage_d_v5/stage_d.pt",
                    help="Path to Stage D bundle checkpoint.")
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT,
                    help="Where to write CSV + audio.")

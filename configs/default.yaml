@@ -1,8 +1,13 @@
 # =============================================================================
-# Language-Conditioned Whole-Body Contact Manipulation — Default Configuration
+# Language-Conditioned Whole-Body Contact Manipulation — Runtime Config
+#
+# This file currently only configures Stage A (the LLM intent parser).
+# All other stages take their hyperparameters from CLI flags on the
+# scripts in `scripts/` and from the per-checkpoint `config.json` files
+# under `models/`.
 # =============================================================================
 
-# ---- Stage A: LLM Structured Intent Extraction ----
+# ---- Stage A: LLM Structured Intent Extraction (src/language/intent_parser.py)
 language:
   model: "gpt-4"
   temperature: 0.0            # deterministic outputs for structured extraction
@@ -20,102 +25,3 @@ language:
           - goal_region: where to push the object (e.g., "left", "right", "forward"), null for press tasks
           - location: where the target is relative to the robot (e.g., "on the left panel"), null if not specified
     Respond ONLY with valid JSON. No explanation.
-
-# ---- Stage B: SAM2 Visual Grounding ----
-perception:
-  sam2:
-    model_size: "large"       # "tiny", "small", "base_plus", "large"
-    checkpoint: null           # path to checkpoint, null = download default
-    confidence_threshold: 0.5  # minimum mask confidence to accept
-  camera:
-    image_width: 640
-    image_height: 480
-    fps: 30
-
-# ---- Stage C: Learning-Based Contact Planner ----
-planner:
-  # Network architecture
-  backbone: "clip"            # frozen vision-language encoder
-  prediction_heads:
-    contact_heatmap: true     # predict contact point as heatmap
-    approach_angle: true      # predict yaw / approach orientation
-    push_vector: true         # predict push direction + magnitude
-  heatmap_resolution: [64, 64]
-
-  # Training
-  training:
-    learning_rate: 1.0e-4
-    batch_size: 32
-    epochs: 100
-    optimizer: "adamw"
-    weight_decay: 1.0e-4
-    scheduler: "cosine"
-    warmup_epochs: 5
-    val_split: 0.15
-
-  # Loss weights
-  loss_weights:
-    contact_heatmap: 1.0
-    approach_angle: 0.5
-    push_vector: 0.5
-
-# ---- Stage D: Closed-Loop Controller ----
-control:
-  reground_frequency_hz: 5    # how often to re-run visual grounding
-  alignment_threshold: 0.02   # meters — acceptable pre-contact error
-  max_approach_steps: 200
-  pid:
-    kp: 1.0
-    ki: 0.0
-    kd: 0.1
-
-# ---- Simulation ----
-simulation:
-  engine: "pybullet"
-  gui: true                   # render GUI during sim
-  timestep: 0.004             # physics timestep (seconds)
-  workspace:
-    x_range: [-0.5, 0.5]      # meters
-    y_range: [-0.5, 0.5]
-    z_range: [0.0, 0.5]
-  tasks:
-    press:
-      panel_size: [0.3, 0.3]  # meters
-      num_targets: 4           # buttons on panel including distractors
-      target_radius: 0.02
-    push:
-      object_types: ["box", "cylinder"]
-      object_mass_range: [0.1, 1.0]  # kg
-      goal_tolerance: 0.05     # meters — success threshold
-
-# ---- Robot (Unitree Go2) ----
-robot:
-  sdk: "unitree_sdk2py"
-  network:
-    robot_ip: "192.168.123.161"   # default Go2 IP
-    local_ip: "192.168.123.222"
-  camera_topic: "/utlidar/rgb_image"
-  control_frequency_hz: 50
-
-# ---- Evaluation ----
-evaluation:
-  num_trials: 20
-  tasks: ["press", "push"]
-  robustness_conditions:
-    - "default"
-    - "low_light"
-    - "shuffled_layout"
-    - "varied_start_pose"
-    - "varied_friction"
-  metrics:
-    - "success_rate"
-    - "pre_contact_alignment_error"
-    - "final_position_error"
-    - "time_to_completion"
-
-# ---- Logging ----
-logging:
-  level: "INFO"
-  save_dir: "logs/"
-  save_video: false
-  save_trajectory: true

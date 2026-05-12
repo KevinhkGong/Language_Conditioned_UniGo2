@@ -1,4 +1,4 @@
-name: env_isaaclab
+name: env_go2
 channels:
   - pytorch
   - nvidia

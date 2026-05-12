@@ -1,51 +1,52 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.eggs/
 dist/
 build/
-.eggs/
 
-# Data & checkpoints
-data/synthetic/*
-data/real/*
-!data/synthetic/.gitkeep
-!data/real/.gitkeep
-*.pt
-*.pth
-*.ckpt
-old_models/
-data/eval/
-
-# Environment
+# Virtual envs / tooling
 .env
 *.env
-.venv_smoke
-.venv311
+.venv*/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
-
-# OS
 .DS_Store
 Thumbs.db
+*.swp
+*~
 
 # Logs
 logs/
 *.log
 wandb/
+/log
+/log/
 
-# Summaries
+# Model artifacts (configs and eval JSON are tracked; weights are not)
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.npz
+old_models/
+
+# Real-robot data & on-device captures — tracked via .gitkeep only
+data/real/*
+!data/real/.gitkeep
+data/eval/
+data/eval_old/
+data/debug/
+data/calibration/
+data/calibration_check/
+data/measurements/
+
+# Working notes (not part of the published repo)
 Implementation_summaries/
-
-  # Debug captures (regrounding screenshots, intermediate frames)                            
-  data/debug/                                               
-
-  # Bare 'log' file/dir (extension-less)
-  /log
-  /log/
-
-  # Defense-in-depth — model & array formats outside known dirs
-  *.h5
-  *.npz
-
